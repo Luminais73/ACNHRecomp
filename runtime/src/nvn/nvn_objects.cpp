@@ -52,7 +52,9 @@ MemoryPool* pool_at_gpu(uint64_t gpu, uint64_t* offset) {
         uint32_t next;
     };
     thread_local Hits t_hits = {};
-    Hits& hits = t_hits;
+    static Hits replay_hits = {};  // the replaying thread's, without the TLS lookup (replay_tls, nvn.h)
+    Hits& hits = g_replay_tls && pthread_equal(pthread_self(), g_replay_thread.load(std::memory_order_relaxed)) ? replay_hits
+                                                                                                          : t_hits;
     uint64_t generation = g_pools_generation.load(std::memory_order_acquire);
     for (const auto& h : hits.at)
         if (h.generation == generation && gpu - h.start < h.size) {

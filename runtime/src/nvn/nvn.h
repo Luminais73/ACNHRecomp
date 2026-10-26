@@ -8,6 +8,7 @@
 // built from the builder through the driver's getters.
 #pragma once
 
+#include <pthread.h>
 #include <type_traits>
 #include <cstdint>
 #include <atomic>
@@ -83,6 +84,15 @@ struct ReplayTls {
     ReplaySlot* textures = nullptr;  // get<Texture>'s replay cache (1024 slots, made on the first use)
 };
 inline thread_local ReplayTls t_replay;
+// The replaying thread's ReplayTls, reached without its thread_local: in a shared library (Android's lib<game>.so) each
+// thread_local access goes through the dynamic TLS resolver (~2% of the replay thread on a Snapdragon 865). ReplayScope
+// sets both; other threads still use their own t_replay.
+inline std::atomic<pthread_t> g_replay_thread{};
+inline ReplayTls* g_replay_tls = nullptr;
+inline ReplayTls& replay_tls() {
+    if (g_replay_tls && pthread_equal(pthread_self(), g_replay_thread.load(std::memory_order_relaxed))) return *g_replay_tls;
+    return t_replay;
+}
 bool resolve_cache_on();  // NX_RESOLVE_CACHE (nvn_incarnation.cpp)
 bool texture_race_old();
 Object* find_object(uint64_t guest, uint64_t mark);  // under objects_lock (shared)
@@ -109,7 +119,7 @@ T* get(uint64_t guest) {
     // (docs/nvn/android-perf/PHASE4.md C4). The game threads bump the lock's generation ~180 times a frame, which
     // emptied the cache below during a replay (get<Texture> was 8.5% of the replay thread). Not for nulls: an object
     // created after the mark resolves to the current one (DEBUG.md #64). NX_RESOLVE_CACHE=0: off.
-    ReplayTls& tl = t_replay;
+    ReplayTls& tl = replay_tls();
     if (uint64_t serial = tl.serial; serial && tl.mark && resolve_cache_on()) {
         ReplaySlot* table;
         if constexpr (std::is_same_v<T, Texture>) {

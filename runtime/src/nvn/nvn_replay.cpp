@@ -18,14 +18,33 @@ namespace {
 // course frame calls hundreds of lists, each looked up twice (the dispatch count, then the replay). The first lookup
 // of a handle in a submit is kept for the rest of it: a list re-recorded meanwhile on the game's recording thread
 // is not mixed into a submit already being replayed. NX_CALL_TABLE=0: every call looks up.
-std::unordered_map<uint64_t, std::shared_ptr<CmdList>> g_called;
-std::vector<std::shared_ptr<CmdList>> g_kept;  // NX_CALL_TABLE=0: what each lookup returned, alive for the submit
+// Open addressing, a slot per handle; a slot of an older submit is empty (no clearing: a submit only bumps the
+// generation). The lists themselves are kept alive by g_kept until the submit ends.
+struct CallSlot {
+    uint64_t handle = 0, generation = 0;
+    CmdList* list = nullptr;
+};
+std::vector<CallSlot> g_calls(1 << 13);
+uint64_t g_call_gen = 1;
+size_t g_call_used = 0;
+std::vector<std::shared_ptr<CmdList>> g_kept;  // what the submit's lookups returned, alive until it ends
+
+void calls_grow() {
+    std::vector<CallSlot> old(g_calls.size() * 2);
+    old.swap(g_calls);
+    for (const CallSlot& s : old)
+        if (s.generation == g_call_gen) {
+            size_t k = (s.handle >> 4) * 0x9E3779B97F4A7C15ull >> 40;
+            while (g_calls[k & (g_calls.size() - 1)].generation == g_call_gen) k++;
+            g_calls[k & (g_calls.size() - 1)] = s;
+        }
+}
 }  // namespace
 
-void submit_lists_reset() { g_called.clear(), g_kept.clear(); }
+void submit_lists_reset() { g_call_gen++, g_call_used = 0, g_kept.clear(); }
 
-// A raw pointer: the submit's table keeps the list alive until the submit ends (a shared_ptr returned by value was an
-// atomic increment and decrement per call, thousands a frame: ~1.5% of the replay thread on a Snapdragon 865).
+// A raw pointer: the submit keeps the list alive until it ends (a shared_ptr returned by value was an atomic increment
+// and decrement per call, thousands a frame). NX_CALL_TABLE=0: every call looks up.
 CmdList* submit_command_list(uint64_t handle) {
     static const bool off = [] {
         const char* e = std::getenv("NX_CALL_TABLE");
@@ -36,10 +55,21 @@ CmdList* submit_command_list(uint64_t handle) {
         if (l) g_kept.push_back(l);
         return l.get();
     }
-    auto it = g_called.find(handle);
-    if (it != g_called.end()) return it->second.get();
+    const size_t mask = g_calls.size() - 1;
+    size_t k = (handle >> 4) * 0x9E3779B97F4A7C15ull >> 40;
+    for (;; k++) {
+        CallSlot& s = g_calls[k & mask];
+        if (s.generation != g_call_gen) break;
+        if (s.handle == handle) return s.list;
+    }
     auto l = command_list(handle);
-    if (l) g_called.emplace(handle, l);
+    if (!l) return nullptr;
+    g_kept.push_back(l);
+    if (++g_call_used * 2 > g_calls.size()) {
+        calls_grow();
+        return submit_command_list(handle);  // found or placed in the larger table; the list is kept twice: fine
+    }
+    g_calls[k & mask] = {handle, g_call_gen, l.get()};
     return l.get();
 }
 

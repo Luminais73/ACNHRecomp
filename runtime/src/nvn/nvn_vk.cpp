@@ -874,6 +874,7 @@ void present_image(const int32_t* crop, Record&& record) {
         return;
     }
     if (!check(r, "vkAcquireNextImageKHR") || !begin()) return;
+    gpu_busy_note_pass("present (frame generation, scaling, overlay)");  // NX_GPU_PROFILE=3: its own label
     bool real = true;
     GpuImage* src = record(g_cb, real);
     GpuImage dst;

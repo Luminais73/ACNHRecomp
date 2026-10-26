@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory_resource>
 
 #include "nvn_draw_state.h"
 
@@ -20,8 +21,11 @@ struct Entry {
     uint64_t size = 0, padded = 0;
     Upload upload;
 };
-// By host address; several sizes of one address are rare, so the latest one is kept.
-std::map<const uint8_t*, Entry> g_copies;
+// By host address; several sizes of one address are rare, so the latest one is kept. Its nodes come from an arena
+// emptied with it at each submit (~2,000 inserts a frame were as many mallocs and frees: ~3% of the replay thread on a
+// Snapdragon 865).
+std::pmr::monotonic_buffer_resource g_arena{1 << 20};
+std::pmr::map<const uint8_t*, Entry> g_copies{&g_arena};
 uint64_t g_saved = 0, g_copied = 0, g_data = 0, g_copies_n = 0, g_big_pads = 0;  // g_data: bytes of guest data among g_copied
 
 // In front of the map (a tree walk per bound buffer of every draw, and most are hits): a slot per address hash with a
@@ -67,7 +71,7 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
     return u;
 }
 
-void dedup_reset() { g_copies.clear(), g_generation++; }
+void dedup_reset() { g_copies.clear(), g_arena.release(), g_generation++; }
 
 void dedup_invalidate(const uint8_t* p, uint64_t size) {
     // Entries starting before p may still reach into it: look back over the few that can.
