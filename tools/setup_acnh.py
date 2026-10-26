@@ -235,6 +235,17 @@ def fix_archives(romfs):
         print(f"{fixed} archives rewritten as the game reads them (size in the zstd frame, big-endian)")
 
 
+def rewrap_messages(game_romfs, romfs):
+    """A translation's dialogue lines wider than the text boxes, re-flowed (tools/msg_rewrap.py), so the game does not
+    break them by itself and leave a word alone on its line. Needs Pillow (to measure with the game's font)."""
+    if not os.path.isdir(os.path.join(romfs, "Message")) or not shutil.which("zstd"):
+        return
+    if subprocess.run([sys.executable, "-c", "import PIL"], capture_output=True).returncode:
+        print("Pillow not found (python3 -m pip install pillow): the translation's long lines are left as they are")
+        return
+    subprocess.run([sys.executable, os.path.join(ROOT, "tools", "msg_rewrap.py"), game_romfs, romfs], check=True)
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--game", default="", help="the game folder: exefs/ and romfs/ (and aoc/) of your own dump")
@@ -402,6 +413,7 @@ def main():
                 with z.open(i) as s, open(out, "wb") as d:
                     shutil.copyfileobj(s, d)
         fix_archives(os.path.join(dst, "romfs"))
+        rewrap_messages(romfs, os.path.join(dst, "romfs"))
 
     # ---- version ------------------------------------------------------------------------------------------------
     say("version")

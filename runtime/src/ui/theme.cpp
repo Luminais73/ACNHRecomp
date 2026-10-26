@@ -6,7 +6,13 @@
 #include <filesystem>
 #include <vector>
 
+#if __has_include(<nx/runtime.h>)
 #include <nx/runtime.h>
+#define THEME_LOG(...) nx::log(__VA_ARGS__)
+#else  // the launcher: no runtime, stderr
+#include <cstdio>
+#define THEME_LOG(fmt, ...) std::fprintf(stderr, fmt "\n", __VA_ARGS__)
+#endif
 
 #include "ui/i18n.h"
 
@@ -125,14 +131,14 @@ ThemeFonts theme_build_fonts(float scale, const std::string& user_font) {
     int w = 0, h = 0;
     auto built = [&] { return io.Fonts->Build() && (io.Fonts->GetTexDataAsRGBA32(&px, &w, &h), w > 0 && h > 0); };
     if (!built() && !extra.empty()) {  // Android's NotoSansCJK-Regular.ttc: the rest without it
-        nx::log("ui: the fonts did not build with %s: without it", extra.c_str());
+        THEME_LOG("ui: the fonts did not build with %s: without it", extra.c_str());
         io.Fonts->Clear();
         extra.clear();
         fonts.body = add(std::round(20.0f * scale));
         fonts.title = add(std::round(30.0f * scale));
     }
     if (!built()) {
-        nx::log("ui: the fonts did not build (%s, %s, %s): the built-in font instead", latin.c_str(), cover.c_str(),
+        THEME_LOG("ui: the fonts did not build (%s, %s, %s): the built-in font instead", latin.c_str(), cover.c_str(),
             extra.c_str());
         io.Fonts->Clear();
         ImFontConfig d;
