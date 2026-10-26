@@ -14,7 +14,7 @@
         <activity android:name="android.app.NativeActivity" android:exported="true"
                   android:screenOrientation="sensorLandscape" android:resizeableActivity="false"
                   android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|smallestScreenSize|uiMode|density|navigation"
-                  android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+                  android:theme="@style/Game">
             <meta-data android:name="android.app.lib_name" android:value="acnh"/>
             <!-- Draw under the camera cutout: the game fills the whole screen. -->
             <meta-data android:name="android.max_aspect" android:value="3.0"/>

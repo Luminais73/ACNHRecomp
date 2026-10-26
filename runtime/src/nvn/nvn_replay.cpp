@@ -19,21 +19,28 @@ namespace {
 // of a handle in a submit is kept for the rest of it: a list re-recorded meanwhile on the game's recording thread
 // is not mixed into a submit already being replayed. NX_CALL_TABLE=0: every call looks up.
 std::unordered_map<uint64_t, std::shared_ptr<CmdList>> g_called;
+std::vector<std::shared_ptr<CmdList>> g_kept;  // NX_CALL_TABLE=0: what each lookup returned, alive for the submit
 }  // namespace
 
-void submit_lists_reset() { g_called.clear(); }
+void submit_lists_reset() { g_called.clear(), g_kept.clear(); }
 
-std::shared_ptr<CmdList> submit_command_list(uint64_t handle) {
+// A raw pointer: the submit's table keeps the list alive until the submit ends (a shared_ptr returned by value was an
+// atomic increment and decrement per call, thousands a frame: ~1.5% of the replay thread on a Snapdragon 865).
+CmdList* submit_command_list(uint64_t handle) {
     static const bool off = [] {
         const char* e = std::getenv("NX_CALL_TABLE");
         return e && e[0] == '0';
     }();
-    if (off) return command_list(handle);
+    if (off) {
+        auto l = command_list(handle);
+        if (l) g_kept.push_back(l);
+        return l.get();
+    }
     auto it = g_called.find(handle);
-    if (it != g_called.end()) return it->second;
+    if (it != g_called.end()) return it->second.get();
     auto l = command_list(handle);
     if (l) g_called.emplace(handle, l);
-    return l;
+    return l.get();
 }
 
 // Live: a file trace_cmds ("<count>") in the data folder traces the next <count> ops as NX_TRACE_CMDS does (checked

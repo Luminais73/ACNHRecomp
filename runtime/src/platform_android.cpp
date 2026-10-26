@@ -30,6 +30,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cmath>
+#include <cctype>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -277,7 +278,12 @@ std::string setting(const std::string& key) {
         auto eq = line.find('=');
         if (eq != std::string::npos && line.substr(0, eq) == key) return line.substr(eq + 1);
     }
-    return {};
+    // Else NX_<KEY>, as on the other platforms: what config.ini set through config_apply (the game language among
+    // others: Android sent the game en-US whatever the settings said).
+    std::string env = "NX_";
+    for (char ch : key) env += char(std::toupper(static_cast<unsigned char>(ch)));
+    const char* v = std::getenv(env.c_str());
+    return v ? v : "";
 }
 
 // ---- window ---------------------------------------------------------------------------------------------------
