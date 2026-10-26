@@ -484,8 +484,9 @@ bool debug_snap_wanted(uint64_t draw) {
     // Live (while playing): a file snap_draws in the data folder, "<offset>,<offset>,..." counted from the draw at
     // which it is read (checked once a second, then deleted): those draws are snapped as listed in NX_SNAP_DRAWS.
     static std::vector<uint64_t> live;
-    static uint64_t next_check = 0;
-    if (uint64_t now = plat::monotonic_ns(); now >= next_check) {
+    static uint64_t next_check = 0, calls = 0;
+    // The clock every 4096 draws, not every draw (it was ~1% of the replay thread): about once a second still.
+    if (uint64_t now = (calls++ & 4095) ? 0 : plat::monotonic_ns(); now >= next_check && now) {
         next_check = now + 1'000'000'000;
         const std::string path = plat::data_root() + "/snap_draws";
         if (FILE* f = plat::fopen_utf8(path, "rb")) {
@@ -504,6 +505,7 @@ bool debug_snap_wanted(uint64_t draw) {
             log("snap_draws: %zu draws from draw %llu", live.size(), (unsigned long long)draw);
         }
     }
+    if (list.empty() && live.empty()) return false;
     return std::find(list.begin(), list.end(), draw) != list.end() || std::find(live.begin(), live.end(), draw) != live.end();
 }
 

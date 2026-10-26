@@ -63,7 +63,9 @@ void janitor_run(std::function<void()> job) {
 }
 
 void janitor_wait(const std::atomic<bool>& done) {
-    for (int k = 0; k < 200 && !done.load(std::memory_order_acquire); k++) plat::yield();  // normally done already
+    // Normally done already. A short spin, then a real wait: 200 yields kept a core busy (~3% of the replay thread in
+    // a heavy island scene, where the reset of ~5,000 descriptor sets was still running): heat for nothing.
+    for (int k = 0; k < 16 && !done.load(std::memory_order_acquire); k++) plat::yield();
     if (done.load(std::memory_order_acquire)) return;
     std::unique_lock lk(g_lock);
     g_done_cv.wait(lk, [&] { return done.load(std::memory_order_acquire); });

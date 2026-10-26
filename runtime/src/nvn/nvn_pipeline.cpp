@@ -292,11 +292,13 @@ const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages
             vb.stageFlags |= stage_bit(s->stage);
         }
     ProgramLayout pl;
-    // On by default on Android only (NX_DYNAMIC_UBO=0/1 overrides): on the Mac (MoltenVK) every frame came out black
-    // and the GPU hung a few thousand frames in (2026-10-01), cause not found yet.
+    // On by default on Android and macOS (NX_DYNAMIC_UBO=0/1 overrides). On the Mac every frame once came out black
+    // and the GPU hung a few thousand frames in (2026-10-01), with MoltenVK's Metal argument buffers on; with them off
+    // (platform_mac.cpp) the island, menus, day and night drew right over ~40,000 frames (2026-10-26), and the sets
+    // made per submit fell from ~27,000 to ~1,100 in a heavy island scene (replay -1 ms a frame).
     static const uint32_t max_dynamic = [] {
         const char* e = std::getenv("NX_DYNAMIC_UBO");
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__APPLE__)
         if (e && e[0] == '0') return 0u;
 #else
         if (!e || e[0] != '1') return 0u;
