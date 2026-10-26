@@ -10,7 +10,6 @@ namespace {
 
 constexpr uint32_t kNifmNoNetwork = (3400u << 9) | 110u;  // nifm error "network not available"
 constexpr uint32_t kGenericFail = (1u << 9) | 110u;
-constexpr uint32_t kLdnDeviceDisabled = (22u << 9) | 203u;  // ldn ResultDeviceDisabled (wireless off)
 
 void ok(CPU& c) { c.x[0] = 0; }
 void no(CPU& c) { c.x[0] = 0; }        // bool false
@@ -21,7 +20,6 @@ void enetdown(CPU& c) { c.x[0] = 50; }  // ENETDOWN
 void eai_fail(CPU& c) { c.x[0] = 4; }   // EAI_FAIL
 void htonl_(CPU& c) { c.x[0] = bswap(uint32_t(c.x[0])); }
 void htons_(CPU& c) { c.x[0] = bswap(uint16_t(c.x[0])); }
-void ldn_disabled(CPU& c) { c.x[0] = kLdnDeviceDisabled; }
 void show_error(CPU& c) {  // the first argument: a Result or an ErrorCode (by value), or a pointer to an argument
     log("nn::err::%s(%#llx)", hle_current_name(), (unsigned long long)c.x[0]);
 }
@@ -72,13 +70,5 @@ NX_HLE("_ZN2nn3err9ShowErrorENS0_9ErrorCodeERKNS0_16CallerIdentifierE", show_err
 NX_HLE("_ZN2nn3err9ShowErrorENS0_9ErrorCodeERKNS0_12ErrorContextERKNS0_16CallerIdentifierE", show_error);
 NX_HLE("_ZN2nn3err20ShowApplicationErrorERKNS0_19ApplicationErrorArgE", show_error);
 NX_HLE("_ZN2nn3err15ShowSystemErrorERKNS0_14SystemErrorArgE", show_error);
-NX_HLE("_ZN2nn3ldn10InitializeEv", ldn_disabled);
-NX_HLE("_ZN2nn3ldn16InitializeSystemEv", ldn_disabled);
-NX_HLE("_ZN2nn3ldn16InitializeSystemEi", ldn_disabled);
-NX_HLE("_ZN2nn3ldn17InitializeMonitorEv", ldn_disabled);
-NX_HLE("_ZN2nn3ldn8FinalizeEv", ok);
-NX_HLE("_ZN2nn3ldn14FinalizeSystemEv", ok);
-NX_HLE("_ZN2nn3ldn15FinalizeMonitorEv", ok);
-NX_HLE("_ZN2nn3ldn8GetStateEv", no);  // State_None: not initialized
 
 }  // namespace nx

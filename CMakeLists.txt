@@ -160,6 +160,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/hle_vi.cpp
     runtime/src/hle_hid.cpp
     runtime/src/hle_net.cpp
+    runtime/src/hle_ldn.cpp
     runtime/src/hle_audio.cpp
     runtime/src/hle_pl.cpp
     runtime/src/hle_nfp.cpp
