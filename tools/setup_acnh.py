@@ -373,6 +373,9 @@ def main():
 
     # ---- recompile ----------------------------------------------------------------------------------------------
     say("recompile (main, sdk, subsdk0)")
+    # Any change to the recompiler (emit.py, emit_ext.py, ...) makes the generated code stale.
+    recomp_mtime = max(os.path.getmtime(os.path.join(ROOT, "recomp", f))
+                       for f in os.listdir(os.path.join(ROOT, "recomp")) if f.endswith(".py"))
     for mod, base in (("sdk", "0x4010000000"), ("subsdk0", "0x4018000000"), ("main", "0x4000000000")):
         h = []
         if mod == "main" and hooks != "-":
@@ -386,7 +389,7 @@ def main():
         if os.path.exists(table) and not os.path.exists(prof_file):  # recompiled before profiles existed: 3.0.2 as is
             open(prof_file, "w").write(profile + "\n")
         stale = (not os.path.exists(table) or force("recomp")
-                 or os.path.getmtime(os.path.join(ROOT, "recomp", "emit.py")) > os.path.getmtime(table)
+                 or recomp_mtime > os.path.getmtime(table)
                  or open(prof_file).read().strip() != profile
                  or (hooks != "-" and mod == "main" and os.path.getmtime(os.path.join(ROOT, hooks)) > os.path.getmtime(table)))
         log = os.path.join(logs, f"recomp_{mod}.log")
