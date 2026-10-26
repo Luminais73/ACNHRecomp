@@ -24,12 +24,14 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -687,6 +689,60 @@ int vulkan_create_surface(void* instance, void* native_window, uint64_t* surface
 
 }  // namespace nx::plat
 
+// ---- per-thread CPU (NX_THREAD_CPU=<seconds>) ---------------------------------------------------------------------
+// Every that many seconds, the threads that used the most CPU over the interval, by name, as a share of one core:
+// what the process spends, where (the replay, the game's threads, Metal's, the audio...), to cut its heat.
+namespace {
+void thread_cpu_watch() {
+    const char* e = std::getenv("NX_THREAD_CPU");
+    const int every = e ? std::atoi(e) : 0;
+    if (every <= 0) return;
+    std::thread([every] {
+        pthread_setname_np("thread cpu");
+        std::map<uint64_t, double> last;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(every));
+            thread_act_array_t threads = nullptr;
+            mach_msg_type_number_t n = 0;
+            if (task_threads(mach_task_self(), &threads, &n) != KERN_SUCCESS) continue;
+            std::vector<std::pair<double, std::string>> rows;
+            std::map<uint64_t, double> now;
+            double total = 0;
+            for (mach_msg_type_number_t k = 0; k < n; k++) {
+                thread_basic_info_data_t bi{};
+                mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+                thread_identifier_info_data_t ii{};
+                mach_msg_type_number_t ic = THREAD_IDENTIFIER_INFO_COUNT;
+                if (thread_info(threads[k], THREAD_BASIC_INFO, thread_info_t(&bi), &c) == KERN_SUCCESS &&
+                    thread_info(threads[k], THREAD_IDENTIFIER_INFO, thread_info_t(&ii), &ic) == KERN_SUCCESS) {
+                    const double t = bi.user_time.seconds + bi.user_time.microseconds / 1e6 + bi.system_time.seconds +
+                                     bi.system_time.microseconds / 1e6;
+                    now[ii.thread_id] = t;
+                    auto it = last.find(ii.thread_id);
+                    const double d = it == last.end() ? 0 : t - it->second;
+                    char name[64] = {};
+                    if (pthread_t pt = pthread_from_mach_thread_np(threads[k])) pthread_getname_np(pt, name, sizeof name);
+                    if (!name[0]) std::snprintf(name, sizeof name, "tid %llu", (unsigned long long)ii.thread_id);
+                    rows.push_back({d, name});
+                    total += d;
+                }
+                mach_port_deallocate(mach_task_self(), threads[k]);
+            }
+            vm_deallocate(mach_task_self(), vm_address_t(threads), n * sizeof(thread_act_t));
+            last = std::move(now);
+            std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.first > b.first; });
+            std::string out;
+            for (size_t k = 0; k < rows.size() && k < 12; k++) {
+                char b[96];
+                std::snprintf(b, sizeof b, "%s%s %.0f%%", k ? ", " : "", rows[k].second.c_str(), 100.0 * rows[k].first / every);
+                out += b;
+            }
+            nx::log("thread cpu: %.0f%% of a core over %d s: %s", 100.0 * total / every, every, out.c_str());
+        }
+    }).detach();
+}
+}  // namespace
+
 // ---- crash handler and entry ----------------------------------------------------------------------------------
 
 namespace {
@@ -749,12 +805,14 @@ int main() {
     }
 
     nx::plat::start_memory_guard();  // before anything can grow: a leak must never freeze the machine
+    thread_cpu_watch();              // NX_THREAD_CPU
 
     // The game on its own thread, with a big stack (recompiled calls nest deeply); the main thread keeps Cocoa's
     // event loop.
     nx::plat::start_thread([](void*) { game_thread(); nx::plat::exit_process(0); }, nullptr, 64ull << 20);
 
     using namespace nx::plat;
+    pthread_setname_np("events");        // the Cocoa main thread (NX_THREAD_CPU names it)
     nx::cpu_profile_register("events");  // NX_CPU_PROFILE (cpu_profile.cpp)
     // One Cocoa event pump per turn (SDL_PollEvent pumps on every call: each pump walks AppKit's gesture recognizers,
     // ~0.25 ms on an M1), then the queue drained without pumping; a turn every 4 ms (250 Hz) when idle.

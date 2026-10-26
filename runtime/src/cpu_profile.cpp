@@ -171,6 +171,17 @@ void sampler() {
 // Called on a thread to be sampled, once; a no-op without NX_CPU_PROFILE.
 void cpu_profile_register(const char* name) {
     if (!interval_us() || t_slot >= 0) return;
+    // NX_CPU_PROFILE_ONLY=<name>,<name>...: only those threads (the game makes more than kThreads).
+    if (const char* only = std::getenv("NX_CPU_PROFILE_ONLY")) {
+        bool listed = false;
+        for (const char* p = only; *p;) {
+            const char* end = std::strchr(p, ',');
+            const size_t n = end ? size_t(end - p) : std::strlen(p);
+            if (n == std::strlen(name) && std::strncmp(p, name, n) == 0) listed = true;
+            p += n + (end ? 1 : 0);
+        }
+        if (!listed) return;
+    }
     static std::atomic<int> next{0};
     static const bool started = [] {
         struct sigaction sa {};

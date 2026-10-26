@@ -156,6 +156,7 @@ void write_back_before_read(const uint8_t* p, uint64_t size, const char* why = "
 bool late_pending(const uint8_t* p, uint64_t size);
 void late_prepare(const uint8_t* p, uint64_t size);  // nvn_frames.cpp: before a storage copy reads guest bytes
 bool late_copy(VkCommandBuffer cb, const uint8_t* p, uint64_t size, VkBuffer to, uint64_t to_offset);
+bool ab_b(const char* name);  // nvn_vk.cpp: NX_AB=<name>, the B half of an in-run A/B test
 uint64_t frame_completed();  // the serial of the last retired submit (for free_retired_images)
 Upload frame_upload_alloc(uint64_t size, uint64_t align);
 VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout);

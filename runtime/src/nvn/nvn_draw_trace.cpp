@@ -350,6 +350,15 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
     if ((count > (1u << 18) || instances > 1024 || uint64_t(count) * instances > (1u << 20)) && big++ < 40)
         log("nvn: huge draw %llu: vs %s fs %s %s count %u x%u", (unsigned long long)g_stats.done, vs->hash.c_str(),
             fs ? fs->hash.c_str() : "-", indexed ? "indexed" : "arrays", count, instances);
+    // The traces below, each behind an env check of its own, were ~3% of a draw's replay with none of them set.
+    static const bool any = [] {
+        for (const char* e : {"NX_TRACE_CUBE_DRAWS", "NX_TRACE_TARGET_SIZE", "NX_TRACE_3D", "NX_TRACE_COUNT",
+                              "NX_TRACE_DRAWS", "NX_TRACE_FRAME", "NX_TRACE_FS_HASH", "NX_TRACE_GLYPHS", "NX_TRACE_SAMPLERS",
+                              "NX_TRACE_SKIN", "NX_TRACE_TARGET", "NX_TRACE_VERTS", "NX_TRACE_VS_BLOCKS"})
+            if (std::getenv(e)) return true;
+        return false;
+    }();
+    if (!any) return;
     trace_cube_draw(t, vs, fs, tex_bindings, handles);
     // NX_TRACE_TARGET_SIZE=<w>x<h>: the draws into colour targets of that size (300 at most), from the start.
     static unsigned size_w = 0, size_h = 0;

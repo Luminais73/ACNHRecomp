@@ -629,8 +629,21 @@ void end_and_wait(VkSemaphore wait, VkSemaphore signal) {
     frame_times().encode_ns += t1 - t0, frame_times().fence_ns += plat::monotonic_ns() - t1;
 }
 
+// NX_AB=<name>: an A/B test within one run. ab_b(name) is false for 1200 presents (logged as "ab A"), then true for
+// as many ("ab B"), and so on: both halves see the same scene and the same heat, which runs one after the other on the
+// fanless M1 did not (the later run was always slower). tools/play/ab_report.py averages each half.
+std::atomic<int> g_ab_phase{0};
+}  // namespace
+bool ab_b(const char* name) {
+    static const char* e = std::getenv("NX_AB");
+    return e && g_ab_phase.load(std::memory_order_relaxed) && std::strcmp(e, name) == 0;
+}
+namespace {
+
 void log_timing(uint64_t frames) {
     auto ms = [&](uint64_t ns) { return double(ns) / 1e6 / double(frames); };
+    static uint64_t ab_frames = 0;
+    if (std::getenv("NX_AB") && (ab_frames += frames) >= 1200) ab_frames = 0, g_ab_phase.store(!g_ab_phase.load());
     static uint64_t last = 0;  // wall clock: the real frame rate
     uint64_t now = plat::monotonic_ns();
     double fps = last ? double(frames) * 1e9 / double(now - last) : 0.0;
@@ -638,10 +651,10 @@ void log_timing(uint64_t frames) {
     const Timing& t = g_timing;
     uint64_t known = t.replay_ns + t.encode_ns + t.fence_ns;
     log("nvn/vk: per frame over %llu: %.1f fps, %.1f submits, replay %.2f ms, submit (encode) %.2f ms, fence wait "
-        "%.2f ms, other %.2f ms, present %.2f ms, upload %.2f MB",
+        "%.2f ms, other %.2f ms, present %.2f ms, upload %.2f MB%s",
         (unsigned long long)frames, fps, double(t.submits) / double(frames), ms(t.replay_ns), ms(t.encode_ns),
         ms(t.fence_ns), ms(t.submit_ns > known ? t.submit_ns - known : 0), ms(t.present_ns),
-        double(t.upload_bytes) / 1e6 / double(frames));
+        double(t.upload_bytes) / 1e6 / double(frames), std::getenv("NX_AB") ? (g_ab_phase.load() ? ", ab B" : ", ab A") : "");
     frame_log(frames);
     creation_log(frames);  // pipelines and ASTC decodes of the window; saves the pipeline cache now and then
     g_timing = {};
