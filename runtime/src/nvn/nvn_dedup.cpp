@@ -39,6 +39,7 @@ Front& front_of(const uint8_t* p) { return g_front[(uintptr_t(p) >> 4 ^ uintptr_
 }  // namespace
 
 Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align) {
+    write_back_before_read(p, size, "dedup");
     if (!p || !size) {
         Upload u = upload_alloc(padded, align);
         std::memset(u.ptr, 0, padded);

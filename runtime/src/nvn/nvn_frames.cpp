@@ -92,6 +92,7 @@ uint32_t g_plan_dispatches = 0, g_seen_dispatches = 0;  // pipelined: the submit
 // waits for the oldest submit (two in flight), and how far into the replay the split came.
 struct Stats {
     uint64_t submits = 0, splits = 0, waited_first = 0, waited_whole = 0, throttled = 0, first_ns = 0, replay_ns = 0;
+    uint64_t late = 0;  // write-backs left to the slot's retirement
     uint64_t chunks = 0;
 } g_stats;
 // A command pool per slot, reset whole when the slot is taken again (PHASE3.md C2): resetting each part's command
@@ -147,6 +148,51 @@ void wait_fences(const VkFence* fences, uint32_t n) {
     g_times.fence_ns += plat::monotonic_ns() - t0;
 }
 
+// Late write-backs (pipelined; NX_WRITE_BACK_LATE=0: off). A submit's compute results used to be waited for right
+// after it was queued, so the replay thread waited for the GPU to finish everything before the frame's last dispatch:
+// ~6 ms a frame on the island (an M1 Air), for 144 bytes in 3 ranges. Now the slot keeps them and applies them when it
+// is retired (the next submits' throttle, normally a frame later). The replay waits for them only where it reads those
+// guest bytes before that (write_back_before_read: uploads and storage bindings); the game's CPU sees them a frame
+// or two later, as a later sync would have shown them on the console.
+struct LateRange {
+    uint64_t serial;
+    const uint8_t* p;     // guest bytes
+    uint64_t size;
+    const uint8_t* from;  // the GPU's copy (upload memory, kept until the slot is retired)
+};
+std::vector<LateRange> g_late;  // under the GPU lock
+const uint8_t* g_late_lo = nullptr;
+const uint8_t* g_late_hi = nullptr;  // the ranges' bounds: most reads are rejected by them
+uint64_t g_late_waits = 0, g_late_reads = 0, g_late_copies = 0;
+
+bool write_back_late() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_WRITE_BACK_LATE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+void late_bounds() {
+    g_late_lo = g_late_hi = nullptr;
+    for (const LateRange& r : g_late) {
+        if (!g_late_lo || r.p < g_late_lo) g_late_lo = r.p;
+        if (!g_late_hi || r.p + r.size > g_late_hi) g_late_hi = r.p + r.size;
+    }
+}
+
+void late_add(uint64_t serial, const uint8_t* p, uint64_t size, const uint8_t* from) {
+    g_late.push_back({serial, p, size, from});
+    late_bounds();
+}
+
+void late_retired(uint64_t serial) {
+    if (g_late.empty()) return;
+    g_late.erase(std::remove_if(g_late.begin(), g_late.end(), [&](const LateRange& r) { return r.serial <= serial; }),
+                 g_late.end());
+    late_bounds();
+}
+
 // Compute results to guest memory: after the fence of the part that holds the submit's dispatches.
 void apply_write_backs(Slot& s) {
     for (const WriteBack& w : s.write_backs) {
@@ -176,6 +222,7 @@ bool retire_oldest() {
     wait_fences(fences, queued_fences(*s, kMaxParts, fences));
     gpu_busy_retired(uint32_t(s - g_slots), s->queued);  // NX_GPU_PROFILE=3
     apply_write_backs(*s);
+    late_retired(s->serial);
     // Its command and descriptor pools: reset on the janitor thread (PHASE4.md C2b), or here (NX_JANITOR=0).
     if (janitor_on()) {
         s->reset_done.store(false, std::memory_order_relaxed);
@@ -204,6 +251,82 @@ void retire_through(uint64_t serial) {
     while (g_completed < serial && retire_oldest()) {
     }
 }
+
+}  // namespace
+
+void write_back_before_read(const uint8_t* p, uint64_t size, const char* why) {
+    if (!g_late_lo || p >= g_late_hi || p + size <= g_late_lo) return;
+    uint64_t serial = 0;
+    for (const LateRange& r : g_late)
+        if (p < r.p + r.size && r.p < p + size) serial = std::max(serial, r.serial);
+    if (!serial) return;
+    g_late_reads++;
+    if (g_completed >= serial) return;
+    g_late_waits++;
+    static int traced = 0;
+    if (traced++ < 4)
+        log("nvn/vk: a late write-back waited for (%s read of %llu bytes)", why, (unsigned long long)size);
+    retire_through(serial);
+}
+
+bool late_in_ring(const LateRange& r) {
+    return r.from >= g_ring_ptr && r.from + r.size <= g_ring_ptr + g_ring_size;
+}
+
+// Whether [p, p + size) meets a late write-back still in flight.
+bool late_pending(const uint8_t* p, uint64_t size) {
+    if (!g_late_lo || p >= g_late_hi || p + size <= g_late_lo) return false;
+    for (const LateRange& r : g_late)
+        if (p < r.p + r.size && r.p < p + size && r.serial > g_completed) return true;
+    return false;
+}
+
+// A storage binding's copy about to be made from guest bytes that late write-backs will change: those not in upload
+// memory are waited for now, before the copy reads the guest bytes (late_copy then adds the rest on the GPU).
+void late_prepare(const uint8_t* p, uint64_t size) {
+    if (!g_late_lo || p >= g_late_hi || p + size <= g_late_lo) return;
+    g_late_reads++;
+    for (const LateRange& r : g_late)
+        if (p < r.p + r.size && r.p < p + size && r.serial > g_completed && !late_in_ring(r)) {
+            g_late_waits++;
+            retire_through(r.serial);
+            return late_prepare(p, size);  // g_late changed
+        }
+}
+
+// The late write-backs' bytes within [p, p + size), copied on the GPU from their submits' results into `to` (whose
+// byte 0 is p's), oldest first: the queue orders them after those submits, so nothing waits. Outside a render pass.
+bool late_copy(VkCommandBuffer cb, const uint8_t* p, uint64_t size, VkBuffer to, uint64_t to_offset) {
+    if (!g_late_lo || p >= g_late_hi || p + size <= g_late_lo) return false;
+    bool any = false;
+    for (const LateRange& r : g_late) {
+        if (r.serial <= g_completed || !late_in_ring(r)) continue;  // already in guest memory
+        const uint8_t* lo = std::max(r.p, p);
+        const uint8_t* hi = std::min(r.p + r.size, p + size);
+        if (lo >= hi) continue;
+        VkBufferCopy c{uint64_t(r.from - g_ring_ptr) + uint64_t(lo - r.p), to_offset + uint64_t(lo - p), uint64_t(hi - lo)};
+        if (!any) {  // the earlier submits' compute writes, before the copies read them
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0,
+                                   nullptr, 0, nullptr);
+        }
+        p_vkCmdCopyBuffer(cb, g_ring, to, 1, &c);
+        any = true;
+    }
+    if (any) {
+        g_late_copies++;
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr,
+                               0, nullptr);
+    }
+    return any;
+}
+
+namespace {
 
 uint32_t replays_in_flight() {
     uint32_t n = 0;
@@ -495,6 +618,9 @@ void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> w
         // results are: they are in the first part when the split came after the last dispatch that wrote storage.
         if (wait_done) {
             retire_through(s.serial);
+        } else if (!s.write_backs.empty() && write_back_late()) {
+            for (const WriteBack& w : s.write_backs) late_add(s.serial, w.to, w.size, w.from);
+            g_stats.late++;
         } else if (!s.write_backs.empty()) {
             if (has_first && has_last && replay::written_bind_count() == s.binds_at_split) {
                 VkFence fences[kMaxParts];
@@ -548,6 +674,11 @@ void frame_log(uint64_t frames) {
         (unsigned long long)t.submits, (unsigned long long)t.splits,
         t.replay_ns ? 100.0 * double(t.first_ns) / double(t.replay_ns) : 0.0, (unsigned long long)t.waited_first,
         (unsigned long long)t.waited_whole, (unsigned long long)t.throttled, (unsigned long long)t.chunks);
+    if (t.late || g_late_reads)
+        log("nvn/vk: late write-backs: %llu submits, %llu reads of their bytes before retirement, %llu copied on the GPU, "
+            "%llu waited", (unsigned long long)t.late, (unsigned long long)g_late_reads,
+            (unsigned long long)g_late_copies, (unsigned long long)g_late_waits);
+    g_late_reads = g_late_waits = g_late_copies = 0;
     g_stats = {};
 }
 

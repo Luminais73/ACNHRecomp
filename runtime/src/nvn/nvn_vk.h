@@ -152,6 +152,10 @@ void frame_submit(VkSemaphore wait, VkSemaphore signal, std::vector<WriteBack> w
 void frame_wait_all();
 uint64_t frame_upload_used();
 uint64_t frame_ring_size();  // the slots' upload ring (0: synchronous submits, no ring)
+void write_back_before_read(const uint8_t* p, uint64_t size, const char* why = "");  // nvn_frames.cpp: a late write-back's bytes
+bool late_pending(const uint8_t* p, uint64_t size);
+void late_prepare(const uint8_t* p, uint64_t size);  // nvn_frames.cpp: before a storage copy reads guest bytes
+bool late_copy(VkCommandBuffer cb, const uint8_t* p, uint64_t size, VkBuffer to, uint64_t to_offset);
 uint64_t frame_completed();  // the serial of the last retired submit (for free_retired_images)
 Upload frame_upload_alloc(uint64_t size, uint64_t align);
 VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout);

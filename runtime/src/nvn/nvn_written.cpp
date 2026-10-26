@@ -140,12 +140,14 @@ Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_
     r.size = n;
     r.cap = std::max(n + kTail, off + padded);
     r.up = alloc_anchored(r.cap, off);
+    late_prepare(lo, n);  // a previous submit's results not yet in guest memory (nvn_frames.cpp)
     std::memcpy(r.up.ptr, lo, n);
     std::memset(r.up.ptr + n, 0, r.cap - n);
     r.before = std::make_shared<std::vector<uint8_t>>(r.up.ptr, r.up.ptr + n);
     for (It it : old)  // their parts: as they were before their own GPU writes
         if (it->second.before)
             std::memcpy(r.before->data() + (it->first - lo), it->second.before->data(), it->second.before->size());
+    late_copy(cb, lo, n, r.up.buffer, r.up.offset);  // those results, from the GPU's copy (before this submit's own)
     if (!old.empty()) {
         copy_regions(cb, old, lo, n, r.up);  // dispatch(): no render pass is open
         for (It it : old) g_regions.erase(it);
@@ -157,6 +159,25 @@ Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_
 }
 
 bool written_read(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out) {
+    if (p && size && !written_separate() && late_pending(p, size)) {
+        // A previous submit's results not yet in guest memory (late write-backs, nvn_frames.cpp): a copy of its own,
+        // those bytes and this submit's written ones copied in on the GPU, newest last.
+        std::vector<It> regions = g_regions.empty() ? std::vector<It>{} : overlapping(p, size);
+        if (It it = containing(p, size, padded, align, regions); !regions.empty() && it != g_regions.end()) {
+            g_shared++, g_read = true;
+            out = at(it, uint64_t(p - it->first));
+            return true;
+        }
+        draw_end_rendering(cb, 2);
+        out = upload_alloc(std::max(padded, size), std::max<uint64_t>(align, 16));
+        late_prepare(p, size);
+        std::memcpy(out.ptr, p, size);
+        if (padded > size) std::memset(out.ptr + size, 0, padded - size);
+        late_copy(cb, p, size, out.buffer, out.offset);
+        if (!regions.empty()) copy_regions(cb, regions, p, size, out);
+        g_composed++;
+        return true;
+    }
     if (!p || !size || g_regions.empty() || written_separate() || !overlaps_any(p, size)) return false;
     std::vector<It> regions = overlapping(p, size);
     if (regions.empty()) return false;
