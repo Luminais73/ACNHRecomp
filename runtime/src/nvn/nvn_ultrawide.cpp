@@ -215,6 +215,8 @@ bool uw_widen_texture(Texture& t) {
     char key[64];
     std::snprintf(key, sizeof key, "%ux%u f%x fmt%x", t.width, t.height, t.flags, t.format);
     if (std::lock_guard lk(seen_lock); seen[key]++ == 0) log("nvn: screen target %s", key);
+    // NX_UW_EXCLUDE="<w>x<h> f<flags> fmt<format>,...": these shapes stay at the game's size (bisecting).
+    if (const char* ex = std::getenv("NX_UW_EXCLUDE"); ex && std::strstr(ex, key)) return false;
     t.uw = true;
     t.base_w = t.width, t.base_h = t.height;
     uw_resize(t);
@@ -305,6 +307,7 @@ void uw_scan(uint64_t present) {
 namespace {
 constexpr uint64_t kProjectionVtable = 0x4a65608;  // sead::PerspectiveProjection's vptr (main+, 3.0.2)
 struct Camera {
+    bool skip = false;                     // not widened (see projection_update)
     uint32_t aspect_set = 0, fov_set = 0;  // what was written last
     uint32_t fov_base = 0;                 // the game's own field of view
 };
@@ -335,6 +338,7 @@ bool is_projection(uint64_t object) {
 
 // One projection for the wanted k (under g_cam_lock). `dirty`: mark it for sead to make the matrix again.
 void rewrite(uint64_t object, Camera& c, float k, bool dirty) {
+    if (c.skip) return;
     const uint32_t wide_bits = bits_of(float(16.0 / 9.0) * k);
     auto* w = reinterpret_cast<volatile uint32_t*>(object);
     uint32_t a = w[0xB0 / 4], f = w[0xA0 / 4];
@@ -382,6 +386,12 @@ void projection_update(CPU& c) {
     auto it = g_cams.find(object);
     if (it == g_cams.end()) {
         it = g_cams.emplace(object, Camera{}).first;
+        // The HUD's minimap renders the island through a camera of its own (updated from main+376d214 in 3.0.2,
+        // +0x10 in 3.0.3): widened, the map came out squeezed into the right of its frame. NX_UW_SKIP_LR=<offset>:
+        // another call site's cameras left alone too (bisecting).
+        static const uint64_t skip_lr = std::getenv("NX_UW_SKIP_LR") ? std::strtoull(std::getenv("NX_UW_SKIP_LR"), nullptr, 16) : 0;
+        const uint64_t lr = c.x[30] - kModuleBase;
+        if (lr == 0x376d214 || lr == 0x376d224 || (skip_lr && lr == skip_lr)) it->second.skip = true;
         static const bool trace = std::getenv("NX_UW_ORTHO_TRACE") != nullptr;
         if (trace) {
             auto* f = reinterpret_cast<volatile float*>(object + 0x98);

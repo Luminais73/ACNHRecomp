@@ -1034,11 +1034,17 @@ void gpu_present(uint64_t texture, const int32_t* crop, int interval) {
             return gen ? gen : src;
         });
         if (!gen) return;
-        uint64_t at = plat::monotonic_ns() + framegen_real_delay_ns(), slept = plat::monotonic_ns();
-        lk.unlock();
-        if (uint64_t now = plat::monotonic_ns(); at > now) plat::sleep_ns(at - now);
-        lk.lock();
-        g_timing.present_ns -= std::min(g_timing.present_ns, plat::monotonic_ns() - slept);
+        // FIFO (VSync): the real frame is queued right behind the generated one and the display shows them a refresh
+        // apart, by itself. The half-frame sleep that timed it made the replay thread wait (replay + delay per game
+        // frame: ~21 fps where the replay took 29 ms on a Snapdragon 865). Without FIFO, or NX_FG_SLEEP=1: the sleep.
+        static const bool sleep_env = std::getenv("NX_FG_SLEEP") && std::getenv("NX_FG_SLEEP")[0] == '1';
+        if (sleep_env || !g_fifo.load()) {
+            uint64_t at = plat::monotonic_ns() + framegen_real_delay_ns(), slept = plat::monotonic_ns();
+            lk.unlock();
+            if (uint64_t now = plat::monotonic_ns(); at > now) plat::sleep_ns(at - now);
+            lk.lock();
+            g_timing.present_ns -= std::min(g_timing.present_ns, plat::monotonic_ns() - slept);
+        }
         if (plat::window_minimized() || !g_swapchain) return;
         present_image(crop, [&](VkCommandBuffer, bool&) { return src; });  // not replayed into meanwhile (same thread)
         return;
