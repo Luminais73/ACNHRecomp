@@ -60,7 +60,7 @@ void lookup_handle(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, Vie
         std::shared_lock lk(objects_lock());
         // A slot empty at the mark was registered after the lists were recorded but before the submit: the current
         // entry (NVN reads descriptors when the GPU runs; DEBUG.md #64). NX_MARK_EMPTY_OLD=1: the empty entry.
-        if (tp && (!pool_entry_at(g_state.texture_pool, tid, t_replay_mark, e) || (!e.has && !mark_empty_old()))) {
+        if (tp && (!pool_entry_at(g_state.texture_pool, tid, t_replay.mark, e) || (!e.has && !mark_empty_old()))) {
             e = {};
             if (auto it = tp->textures.find(tid); it != tp->textures.end()) e.has = true, e.texture = it->second;
             if (auto it = tp->snapshots.find(tid); it != tp->snapshots.end()) e.snapshot = it->second;
@@ -69,7 +69,7 @@ void lookup_handle(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, Vie
         SamplerSlot ss;
         // A slot empty at the mark was registered after the lists were recorded but before the submit (NVN reads
         // descriptors when the GPU runs): the current entry is the one.
-        if (sp && sampler_entry_at(g_state.sampler_pool, sid, t_replay_mark, ss) && ss.has) {
+        if (sp && sampler_entry_at(g_state.sampler_pool, sid, t_replay.mark, ss) && ss.has) {
             sampler = ss.info;
             if (has_sampler) *has_sampler = true;
         } else if (sp) {
@@ -117,7 +117,7 @@ std::string explain_texture_slot(uint64_t handle) {
     if (!tp) return "no pool";
     std::shared_lock lk(objects_lock());
     PoolEntry e;
-    bool at_mark = pool_entry_at(g_state.texture_pool, tid, t_replay_mark, e);
+    bool at_mark = pool_entry_at(g_state.texture_pool, tid, t_replay.mark, e);
     auto cur = tp->textures.find(tid);
     auto cs = tp->snapshots.find(tid);
     auto desc = [](uint64_t key) {
@@ -129,7 +129,7 @@ std::string explain_texture_slot(uint64_t handle) {
         return std::string(b);
     };
     char b[160];
-    std::snprintf(b, sizeof b, "{id %x mark %llu now %llu: ", tid, (unsigned long long)t_replay_mark,
+    std::snprintf(b, sizeof b, "{id %x mark %llu now %llu: ", tid, (unsigned long long)t_replay.mark,
                   (unsigned long long)current_epoch());
     std::string s = b;
     if (at_mark) s += "at mark " + (e.has ? desc(e.texture) : std::string("empty")) + " snap " + desc(e.snapshot) + "; ";
@@ -167,7 +167,7 @@ void handles_reset() { g_handle_generation++, g_handle_used = 0; }
 // The slot of `handle` in the bound pools, filled on first use; null without a replay mark (NX_TEXTURE_RACE_OLD: a
 // lookup then answers as of now) or with NX_DRAW_SLOW. Valid until the next call.
 HandleSlot* handle_slot(uint64_t handle) {
-    uint64_t mark = t_replay_mark;
+    uint64_t mark = t_replay.mark;
     if (!mark || draw_slow(kSlowHandles)) return nullptr;
     if (mark != g_handle_mark || g_handle_used > kHandleSlots / 2) handles_reset(), g_handle_mark = mark;
     handle &= 0xFFFFFFFFull;  // 20 bits of texture id, 12 of sampler id

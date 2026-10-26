@@ -47,10 +47,14 @@ void pool_unregister(MemoryPool* p) {
 // Asked for every buffer a replayed draw binds, mostly in the same few pools: each thread keeps the last ranges it
 // found, good until a pool is registered or unregistered (a pool's address and size are final when it registers).
 MemoryPool* pool_at_gpu(uint64_t gpu, uint64_t* offset) {
-    thread_local struct { uint64_t generation, start, size; MemoryPool* pool; } hits[8] = {};
-    thread_local uint32_t next = 0;
+    struct Hits {  // one thread_local: each is a call to reach on macOS
+        struct { uint64_t generation, start, size; MemoryPool* pool; } at[8];
+        uint32_t next;
+    };
+    thread_local Hits t_hits = {};
+    Hits& hits = t_hits;
     uint64_t generation = g_pools_generation.load(std::memory_order_acquire);
-    for (const auto& h : hits)
+    for (const auto& h : hits.at)
         if (h.generation == generation && gpu - h.start < h.size) {
             if (offset) *offset = gpu - h.start;
             return h.pool;
@@ -61,7 +65,7 @@ MemoryPool* pool_at_gpu(uint64_t gpu, uint64_t* offset) {
     --it;
     MemoryPool* p = it->second;
     if (gpu - p->gpu >= p->size) return nullptr;
-    hits[next++ & 7] = {g_pools_generation.load(std::memory_order_relaxed), p->gpu, p->size, p};
+    hits.at[hits.next++ & 7] = {g_pools_generation.load(std::memory_order_relaxed), p->gpu, p->size, p};
     if (offset) *offset = gpu - p->gpu;
     return p;
 }

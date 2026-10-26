@@ -8,6 +8,7 @@
 // built from the builder through the driver's getters.
 #pragma once
 
+#include <type_traits>
 #include <cstdint>
 #include <atomic>
 #include <functional>
@@ -69,8 +70,19 @@ std::unordered_map<uint64_t, std::unique_ptr<Object>>& objects();
 // retires, with an epoch, and a replay's lookups (t_replay_mark != 0) return the one current at its mark. Retired
 // objects live on as deferred objects until drain_objects, which also forgets the records. Game threads (mark 0)
 // always see the current one. NX_TEXTURE_RACE_OLD=1: no records, no marks (the old behaviour).
-inline thread_local uint64_t t_replay_mark = 0;  // the replaying thread's mark; 0 outside a replay
-inline thread_local uint64_t t_replay_serial = 0;  // which replay (ReplayScope counts them): keys get<T>'s replay cache
+// One thread_local for all of it: on macOS each access to one is a call (tlv_get_addr), and get<Texture> made three
+// per lookup, ~3% of the replay thread at 60 fps.
+struct Texture;
+struct ReplaySlot {
+    uint64_t guest = 0, serial = 0;
+    void* object = nullptr;
+};
+struct ReplayTls {
+    uint64_t mark = 0;    // the replaying thread's mark; 0 outside a replay
+    uint64_t serial = 0;  // which replay (ReplayScope counts them): keys get<T>'s replay cache
+    ReplaySlot* textures = nullptr;  // get<Texture>'s replay cache (1024 slots, made on the first use)
+};
+inline thread_local ReplayTls t_replay;
 bool resolve_cache_on();  // NX_RESOLVE_CACHE (nvn_incarnation.cpp)
 bool texture_race_old();
 Object* find_object(uint64_t guest, uint64_t mark);  // under objects_lock (shared)
@@ -97,18 +109,22 @@ T* get(uint64_t guest) {
     // (docs/nvn/android-perf/PHASE4.md C4). The game threads bump the lock's generation ~180 times a frame, which
     // emptied the cache below during a replay (get<Texture> was 8.5% of the replay thread). Not for nulls: an object
     // created after the mark resolves to the current one (DEBUG.md #64). NX_RESOLVE_CACHE=0: off.
-    if (uint64_t serial = t_replay_serial; serial && t_replay_mark && resolve_cache_on()) {
-        struct Slot {
-            uint64_t guest = 0, serial = 0;
-            T* object = nullptr;
-        };
-        thread_local Slot table[1024];
-        Slot& s = table[((guest >> 4) ^ (guest >> 14)) & 1023];
-        if (s.serial == serial && s.guest == guest) return s.object;
+    ReplayTls& tl = t_replay;
+    if (uint64_t serial = tl.serial; serial && tl.mark && resolve_cache_on()) {
+        ReplaySlot* table;
+        if constexpr (std::is_same_v<T, Texture>) {
+            if (!tl.textures) tl.textures = new ReplaySlot[1024];  // per thread, for the process's life
+            table = tl.textures;
+        } else {
+            thread_local ReplaySlot own[1024];
+            table = own;
+        }
+        ReplaySlot& s = table[((guest >> 4) ^ (guest >> 14)) & 1023];
+        if (s.serial == serial && s.guest == guest) return static_cast<T*>(s.object);
         T* p;
         {
             std::shared_lock lk(objects_lock());
-            p = dynamic_cast<T*>(find_object(guest, t_replay_mark));
+            p = dynamic_cast<T*>(find_object(guest, tl.mark));
         }
         if (p) s = {guest, serial, p};
         return p;
@@ -119,7 +135,7 @@ T* get(uint64_t guest) {
     };
     thread_local Entry cache[8];
     ObjectsLock& ol = objects_lock();
-    uint64_t gen = ol.generation.load(std::memory_order_acquire), mark = t_replay_mark;
+    uint64_t gen = ol.generation.load(std::memory_order_acquire), mark = tl.mark;
     Entry& e = cache[((guest >> 3) ^ (guest >> 11)) & 7];
     if (e.generation == gen && e.guest == guest && e.mark == mark) return e.object;
     T* p;

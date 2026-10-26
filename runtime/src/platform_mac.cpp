@@ -739,6 +739,10 @@ int main() {
     // 2 synchronous; the image views it named were all alive). Set before the Vulkan library loads; an
     // MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS in the environment wins.
     setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "1", 0);
+    // Descriptor sets as Metal argument buffers (MoltenVK's default) cost the replay ~2.5 ms a frame at ~4000 sets a
+    // frame: walking about the island's north at 60 fps on an M1 Air, replay 12.5 -> 10.1 ms and 56-59 -> 60 fps,
+    // the picture the same (island, inventory, phone, map). Off; an MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS set wins.
+    setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0);
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
