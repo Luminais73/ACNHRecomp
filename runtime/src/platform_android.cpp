@@ -398,10 +398,11 @@ void* load_vulkan() {
     __system_property_get("ro.hardware.vulkan", vk);
     const std::string turnip = g_native_lib_dir + "/libvulkan_freedreno.so";
     if (pick != "system" && std::strcmp(vk, "adreno") == 0 && !g_native_lib_dir.empty() && access(turnip.c_str(), R_OK) == 0) {
-        // Turnip's binning pass faulted the GPU on this game (a write at address 0x40 from VSC/VPC, the kernel's log)
-        // and hung it; without binning (still rendering in tiles) the same frames draw right. config.txt can still
-        // set TU_DEBUG itself.
-        setenv("TU_DEBUG", "nobin", 0);
+        // Binning on (Turnip's default): the main pass and the whole frame took much less GPU time with it on the S20
+        // FE's Adreno 650 (the intro 27 -> ~18 ms a frame) and it ran without a fault through every test on 2026-10-26.
+        // It once faulted the GPU on this game (a write at 0x40 from VSC/VPC); NX_TURNIP_NOBIN=1 turns it off again,
+        // and config.txt can set TU_DEBUG itself.
+        if (const char* e = getenv("NX_TURNIP_NOBIN"); e && e[0] == '1') setenv("TU_DEBUG", "nobin", 0);
         std::string tmp = g_cache_dir + "/adrenotools/";
         mkdir(tmp.c_str(), 0700);
         std::string libs = g_native_lib_dir + "/";
