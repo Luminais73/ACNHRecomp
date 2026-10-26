@@ -209,6 +209,32 @@ def link(target, p):
         os.symlink(target, p, target_is_directory=True)
 
 
+def fix_archives(romfs):
+    """A mod's .sarc.zs archives as the game reads them (tools/sarc_endian.py): a zstd frame without its decompressed
+    size, or little-endian headers, crashed the game at boot (a translation tool's output)."""
+    if not shutil.which("zstd"):
+        print("zstd not found: the mod's archives are not checked")
+        return
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import sarc_endian
+    fixed = 0
+    for base, _, files in os.walk(romfs):
+        for f in files:
+            if not f.endswith(".sarc.zs"):
+                continue
+            path = os.path.join(base, f)
+            info = subprocess.run(["zstd", "-lv", path], capture_output=True, text=True).stdout
+            data = sarc_endian.read(path)
+            if "Decompressed Size" in info and "XXH64" not in info and data[6:8] == b"\xfe\xff":
+                continue
+            subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "sarc_endian.py"), path, path + ".tmp.zs"],
+                           check=True)
+            os.replace(path + ".tmp.zs", path)
+            fixed += 1
+    if fixed:
+        print(f"{fixed} archives rewritten as the game reads them (size in the zstd frame, big-endian)")
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--game", default="", help="the game folder: exefs/ and romfs/ (and aoc/) of your own dump")
@@ -338,6 +364,19 @@ def main():
         print(f"add-on content: {sum(1 for e in os.scandir(aoc) if e.is_dir())}")
 
     # ---- mods: a zip with romfs/ at its root (or one folder holding it), extracted to <folder>/mods/<name>/ ---------
+    # Without --mod, a pt-BR translation package found in the game folder or in private/translations/ (the player's own
+    # copy: never in this repository) is installed as "ptbr" when it is newer than the one installed.
+    if not a.mod:
+        found = []
+        game_src = open(src_file, encoding="utf-8").read().strip() if os.path.exists(src_file) else ""
+        for d in (game_src, os.path.join(ROOT, "private", "translations")):
+            if d and os.path.isdir(d):
+                found += [os.path.join(d, f) for f in os.listdir(d) if f.lower().endswith(".zip") and "ptbr" in f.lower()]
+        if found:
+            newest = max(found, key=os.path.getmtime)
+            have = os.path.join(G, "mods", "ptbr", "romfs")
+            if not os.path.isdir(have) or os.path.getmtime(newest) > os.path.getmtime(have):
+                a.mod.append("ptbr=" + newest)
     for m in a.mod:
         name, _, zpath = m.partition("=")
         if not name or not os.path.isfile(zpath):
@@ -362,6 +401,7 @@ def main():
                 os.makedirs(os.path.dirname(out), exist_ok=True)
                 with z.open(i) as s, open(out, "wb") as d:
                     shutil.copyfileobj(s, d)
+        fix_archives(os.path.join(dst, "romfs"))
 
     # ---- version ------------------------------------------------------------------------------------------------
     say("version")
