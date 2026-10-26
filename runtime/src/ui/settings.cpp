@@ -705,6 +705,16 @@ void page_about() {
     report_section();
 }
 
+// Android without a controller: the screen is used by touch, so no keyboard keys are shown (the footer's hints, the
+// PgUp / PgDn page buttons, "(Esc)" on the resume button); with a controller its buttons are.
+bool touch_only() {
+#if defined(__ANDROID__)
+    return plat::controller_kind().empty();
+#else
+    return false;
+#endif
+}
+
 // The button names the hints show (the footer, "Back to the game (B)"): the keyboard's keys with no controller, else
 // the controller's (or the chosen icon style's): the bottom face button confirms and the right one cancels.
 struct NavNames {
@@ -783,7 +793,8 @@ bool settings_draw(float scale, ImFont* title) {
         ImVec2 ts = ImGui::CalcTextSize(tr("app.title"));
         dl->AddText(ImVec2(p.x + h * 1.1f, p.y + (h - ts.y) * 0.5f), rgb(255, 255, 255), tr("app.title"));
         ImGui::PopFont();
-        std::string resume_text = std::string(tr("common.resume")) + " (" + nav_names().back + ")";
+        std::string resume_text = touch_only() ? std::string(tr("common.resume"))
+                                               : std::string(tr("common.resume")) + " (" + nav_names().back + ")";
         float bw = std::max(130.0f * scale, ImGui::CalcTextSize(resume_text.c_str()).x + 36 * scale);
         ImGui::SetCursorScreenPos(ImVec2(p.x + w - bw - 10 * scale, p.y + (h - ImGui::GetFrameHeight()) * 0.5f));
         ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(255, 255, 255, 230));
@@ -831,7 +842,9 @@ bool settings_draw(float scale, ImFont* title) {
     bool l_down = ImGui::IsKeyDown(ImGuiKey_GamepadL1) || ImGui::IsKeyDown(ImGuiKey_GamepadL2) || ImGui::IsKeyDown(ImGuiKey_PageUp);
     bool r_down = ImGui::IsKeyDown(ImGuiKey_GamepadR1) || ImGui::IsKeyDown(ImGuiKey_GamepadR2) || ImGui::IsKeyDown(ImGuiKey_PageDown);
 
-    if (!portrait) {
+    if (touch_only()) {
+        // No page buttons: the pages below are touched directly.
+    } else if (!portrait) {
         float avail_w = ImGui::GetContentRegionAvail().x;
         float gap = 8.0f * scale;
         float bw = (avail_w - gap) * 0.5f;
@@ -959,8 +972,10 @@ bool settings_draw(float scale, ImFont* title) {
             ImGui::SameLine();
         } else {
             ImGui::AlignTextToFramePadding();
-            ImGui::TextColored(ImVec4(0.50f, 0.45f, 0.38f, 1.0f), "%s", nav_hint(nav_names()).c_str());
-            ImGui::SameLine();
+            if (!touch_only()) {
+                ImGui::TextColored(ImVec4(0.50f, 0.45f, 0.38f, 1.0f), "%s", nav_hint(nav_names()).c_str());
+                ImGui::SameLine();
+            }
         }
         float qw = ImGui::CalcTextSize(tr("common.quit_game")).x + 30 * scale;
         ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x - qw);
