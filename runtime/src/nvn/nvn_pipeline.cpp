@@ -653,14 +653,17 @@ VkPipeline pipeline_for(const PipelineKey& canon, const ProgramLayout& layout, b
         if (t->state.load() != 2) {
             // Skipped while a worker builds it, but never for long: behind hundreds of prewarmed pipelines a draw's
             // own waited for seconds and the 3D scene stayed black (only the UI drawn). It is moved to the front of
-            // the queue, and after 150 ms the replay waits for it as without async_skip.
+            // the queue, and after 150 ms the replay builds it itself if no worker took it yet. One a worker is
+            // building is skipped for up to a second: a single pipeline took ~450-600 ms on the M1 (Metal compiling a
+            // large shader), and waiting for it froze the island that long when leaving the house.
             if (async_skip()) {
                 const uint64_t now = plat::monotonic_ns();
                 if (!t->wanted_ns) {
                     t->wanted_ns = now;
                     if (t->state.load() == 0) enqueue(t, true);
                 }
-                if (now - t->wanted_ns < 150'000'000ull) return *pending = true, VK_NULL_HANDLE;
+                const uint64_t limit = t->state.load() == 1 ? 1'000'000'000ull : 150'000'000ull;
+                if (now - t->wanted_ns < limit) return *pending = true, VK_NULL_HANDLE;
             }
             const uint64_t t0 = plat::monotonic_ns();
             t->wait();
