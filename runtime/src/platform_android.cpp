@@ -699,6 +699,9 @@ extern "C" void android_main(android_app* app) {
         else
             setenv("NX_HANDHELD", "1", 0);
     }
+    // config.ini (the settings screen's file, as on the other platforms): NX_* defaults for what config.txt left unset.
+    // Without it the game language, frame generation and the frame rate chosen there were ignored on Android.
+    nx::config_apply();
     // The heap (scudo) zero-fills every allocation and gives freed pages back at once by default: in the replay, a
     // memset under each allocation and madvise churn (docs/nvn/android-perf/PLAN.md, phase 2). NX_MALLOC_TUNE=0: as
     // the system set it.
