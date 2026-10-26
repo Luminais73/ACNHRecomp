@@ -509,6 +509,11 @@ bool enabled() {
         // Off by default until it is measured to help: the replay got faster (14 -> 8 ms on a hot M1 Air at 60 fps),
         // but frames then waited ~8 ms on fences and the frame rate did not rise. NX_VK_DEFER=1: on.
         const char* e = std::getenv("NX_VK_DEFER");
+#if defined(__ANDROID__)
+        // On by default on Android: Turnip's own CPU work per call moves off the replay thread (S20 FE on the island:
+        // replay 29 -> 25.8 ms a frame, 23.5 -> 24.5 fps). NX_VK_DEFER=0: off.
+        if (!e) return true;
+#endif
         return e && e[0] == '1';
     }();
     return on;
