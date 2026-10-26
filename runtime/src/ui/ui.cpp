@@ -208,7 +208,12 @@ void build_fonts(float scale) {
     ThemeFonts f = theme_build_fonts(scale, plat::data_root() + "/fonts/ui.ttf");  // a font of the player's choice
     g_font_body = f.body, g_font_title = f.title;
     g_font_scale = scale, g_font_lang = ui_language();
-    if (g_imgui_ok) ImGui_ImplVulkan_CreateFontsTexture();
+    unsigned char* px = nullptr;
+    int w = 0, h = 0;
+    ImGui::GetIO().Fonts->GetTexDataAsRGBA32(&px, &w, &h);
+    static int logged = 0;
+    if (logged++ < 4) log("ui: fonts at scale %.2f: atlas %dx%d", double(scale), w, h);
+    if (g_imgui_ok && w > 0 && h > 0) ImGui_ImplVulkan_CreateFontsTexture();  // never a zero-sized texture
 }
 
 bool init_imgui(VkFormat format) {
@@ -358,7 +363,42 @@ void ui_vulkan_ready(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhys
     if (!g_vk_ok) log("ui: Vulkan functions missing: no settings screen");
 }
 
+// The swapchain's preTransform as quarter turns (Android: 1, the landscape picture in a portrait image). The screen is
+// laid out upright and its vertices turned into the image as the present pass does (nvn_present.cpp kRot): drawn
+// straight into the portrait image, it came out sideways in a corner.
+std::atomic<int> g_quarter{0};
+void ui_set_rotation(int quarter_turns) { g_quarter = quarter_turns & 3; }
+
+namespace {
+void rotate_draw_data(ImDrawData* dd, int r, float uw, float uh) {
+    auto map = [&](float x, float y) -> ImVec2 {
+        switch (r) {
+            case 1: return ImVec2(uh - y, x);
+            case 2: return ImVec2(uw - x, uh - y);
+            case 3: return ImVec2(y, uw - x);
+            default: return ImVec2(x, y);
+        }
+    };
+    for (int n = 0; n < dd->CmdListsCount; n++) {
+        ImDrawList* l = dd->CmdLists[n];
+        for (ImDrawVert& v : l->VtxBuffer) v.pos = map(v.pos.x, v.pos.y);
+        for (ImDrawCmd& c : l->CmdBuffer) {
+            ImVec2 a = map(c.ClipRect.x, c.ClipRect.y), b = map(c.ClipRect.z, c.ClipRect.w);
+            c.ClipRect = ImVec4(std::min(a.x, b.x), std::min(a.y, b.y), std::max(a.x, b.x), std::max(a.y, b.y));
+        }
+    }
+    const bool side = r == 1 || r == 3;
+    dd->DisplayPos = ImVec2(0, 0);
+    dd->DisplaySize = side ? ImVec2(uh, uw) : ImVec2(uw, uh);
+}
+}  // namespace
+
 void ui_record(VkCommandBuffer cb, VkImage image, VkFormat format, VkExtent2D extent) {
+    static bool open_checked = false;  // NX_UI_OPEN read here too: Android sets config.txt's variables after static init
+    if (!open_checked) open_checked = true, g_visible = g_visible || std::getenv("NX_UI_OPEN") != nullptr;
+    const int quarter = g_quarter.load();
+    const bool sideways = quarter == 1 || quarter == 3;
+    const float up_w = float(sideways ? extent.height : extent.width), up_h = float(sideways ? extent.width : extent.height);
     using clock = std::chrono::steady_clock;
     // The hint comes a second after the game's first picture (not over the black frames of its boot), for 8 s.
     const int64_t pic = g_picture_ns;
@@ -370,12 +410,12 @@ void ui_record(VkCommandBuffer cb, VkImage image, VkFormat format, VkExtent2D ex
     if ((!g_visible && !hint && !show_fps) || !extent.width || !extent.height) return;
     if (!init_imgui(format)) return;
     ImGuiIO& io = ImGui::GetIO();
-    float scale = theme_scale(float(extent.width), float(extent.height));
+    float scale = theme_scale(up_w, up_h);
     if (std::fabs(scale - g_font_scale) > 0.04f || g_font_lang != ui_language()) {
         build_fonts(scale);
         theme_apply_style(scale);
     }
-    io.DisplaySize = ImVec2(float(extent.width), float(extent.height));
+    io.DisplaySize = ImVec2(up_w, up_h);
     static auto last = clock::now();
     auto now = clock::now();
     io.DeltaTime = std::clamp(std::chrono::duration<float>(now - last).count(), 1.0f / 240.0f, 0.25f);
@@ -396,6 +436,7 @@ void ui_record(VkCommandBuffer cb, VkImage image, VkFormat format, VkExtent2D ex
     ImGui::Render();
     ImDrawData* dd = ImGui::GetDrawData();
     if (!dd || dd->CmdListsCount == 0) return;
+    if (quarter) rotate_draw_data(dd, quarter, up_w, up_h);
     VkImageView view = view_for(image, format);
     if (!view) return;
     barrier(cb, image, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,

@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <vector>
 
+#include <nx/runtime.h>
+
 #include "ui/i18n.h"
 
 namespace nx::ui {
@@ -117,6 +119,30 @@ ThemeFonts theme_build_fonts(float scale, const std::string& user_font) {
     ThemeFonts fonts;
     fonts.body = add(std::round(20.0f * scale));
     fonts.title = add(std::round(30.0f * scale));
+    // A font file the atlas cannot use makes the whole build fail and leaves it empty (0x0): on Android the backend then
+    // made a zero-sized texture and the driver crashed. Then: the built-in font alone.
+    unsigned char* px = nullptr;
+    int w = 0, h = 0;
+    auto built = [&] { return io.Fonts->Build() && (io.Fonts->GetTexDataAsRGBA32(&px, &w, &h), w > 0 && h > 0); };
+    if (!built() && !extra.empty()) {  // Android's NotoSansCJK-Regular.ttc: the rest without it
+        nx::log("ui: the fonts did not build with %s: without it", extra.c_str());
+        io.Fonts->Clear();
+        extra.clear();
+        fonts.body = add(std::round(20.0f * scale));
+        fonts.title = add(std::round(30.0f * scale));
+    }
+    if (!built()) {
+        nx::log("ui: the fonts did not build (%s, %s, %s): the built-in font instead", latin.c_str(), cover.c_str(),
+            extra.c_str());
+        io.Fonts->Clear();
+        ImFontConfig d;
+        d.SizePixels = std::round(20.0f * scale);
+        fonts.body = io.Fonts->AddFontDefault(&d);
+        ImFontConfig t;
+        t.SizePixels = std::round(30.0f * scale);
+        fonts.title = io.Fonts->AddFontDefault(&t);
+        io.Fonts->Build();
+    }
     return fonts;
 }
 

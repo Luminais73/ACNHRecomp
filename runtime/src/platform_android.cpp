@@ -488,6 +488,38 @@ void game_thread(void*) {
 
 void request_immersive();  // below: runs on the UI thread
 
+// Whether a physical game controller is connected (InputDevice: a gamepad or joystick source, not virtual), through
+// JNI on android_main's thread.
+bool gamepad_connected(android_app* app) {
+    static JNIEnv* env = nullptr;
+    if (!env && app->activity->vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return false;
+    jclass dev = env->FindClass("android/view/InputDevice");
+    if (!dev || env->ExceptionCheck()) return env->ExceptionClear(), false;
+    jmethodID ids_m = env->GetStaticMethodID(dev, "getDeviceIds", "()[I");
+    jmethodID get_m = env->GetStaticMethodID(dev, "getDevice", "(I)Landroid/view/InputDevice;");
+    jmethodID src_m = env->GetMethodID(dev, "getSources", "()I");
+    jmethodID virt_m = env->GetMethodID(dev, "isVirtual", "()Z");
+    bool found = false;
+    if (ids_m && get_m && src_m && virt_m) {
+        auto ids = static_cast<jintArray>(env->CallStaticObjectMethod(dev, ids_m));
+        jsize n = ids ? env->GetArrayLength(ids) : 0;
+        jint* v = n ? env->GetIntArrayElements(ids, nullptr) : nullptr;
+        for (jsize k = 0; k < n && !found; k++) {
+            jobject d = env->CallStaticObjectMethod(dev, get_m, v[k]);
+            if (!d) continue;
+            const jint src = env->CallIntMethod(d, src_m);
+            const bool virt = env->CallBooleanMethod(d, virt_m);
+            found = !virt && ((src & 0x401) == 0x401 || (src & 0x1000010) == 0x1000010);  // SOURCE_GAMEPAD / _JOYSTICK
+            env->DeleteLocalRef(d);
+        }
+        if (v) env->ReleaseIntArrayElements(ids, v, JNI_ABORT);
+        if (ids) env->DeleteLocalRef(ids);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear(), found = false;
+    env->DeleteLocalRef(dev);
+    return found;
+}
+
 void on_cmd(android_app* app, int32_t cmd) {
     using namespace nx::plat;
     switch (cmd) {
@@ -747,6 +779,12 @@ extern "C" void android_main(android_app* app) {
             start_thread(game_thread, nullptr, 256ull << 20);  // the guest main thread; deep host recursion
         }
         if (started) sleep_ns(2'000'000);
+        // Every 2 s: whether a game controller is connected (the touch controls hide while one is).
+        static uint64_t next_pad_poll = 0;
+        if (uint64_t now = monotonic_ns(); now >= next_pad_poll) {
+            next_pad_poll = now + 2'000'000'000;
+            set_gamepad_connected(gamepad_connected(app));
+        }
     }
 }
 

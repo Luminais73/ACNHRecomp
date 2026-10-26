@@ -4,6 +4,7 @@
 namespace nx::ui {
 
 void ui_vulkan_ready(PFN_vkGetInstanceProcAddr, VkInstance, VkPhysicalDevice, VkDevice, uint32_t, VkQueue, bool) {}
+void ui_set_rotation(int) {}
 void ui_record(VkCommandBuffer, VkImage, VkFormat, VkExtent2D) {}
 void ui_swapchain_changed() {}
 void ui_picture_shown() {}

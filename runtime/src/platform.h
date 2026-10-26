@@ -107,6 +107,7 @@ struct OverlayShape {
     float x, y, r, alpha;
 };
 size_t touch_overlay(OverlayShape* out, size_t max);
+void set_gamepad_connected(bool connected);  // Android: a controller connected hides the touch controls
 // Performance hints (perf_hint.cpp; Android ADPF, nothing elsewhere): the calling thread takes part in making frames;
 // a frame's work took `ns`.
 void perf_hint_thread();

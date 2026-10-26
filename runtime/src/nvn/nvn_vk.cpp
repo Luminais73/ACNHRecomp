@@ -493,6 +493,10 @@ bool make_swapchain() {
     p_vkGetSwapchainImagesKHR(g_device, g_swapchain, &n, g_sc_images.data());
     g_sc_extent = extent;
     g_sc_transform = ci.preTransform;
+    ui::ui_set_rotation(ci.preTransform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR    ? 1
+                        : ci.preTransform == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR ? 2
+                        : ci.preTransform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR ? 3
+                                                                                     : 0);
     if (n > 8) log("nvn/vk: %u swapchain images: more than the 8 present semaphores (nvn_frames.cpp)", n);
     bool drawn = pass && present_pass_targets(g_sc_format, g_sc_images, extent, ci.preTransform);
     if (pass && !drawn && present_pass_failed()) {  // the pass is out: an upright swapchain for the blit

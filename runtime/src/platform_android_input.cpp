@@ -66,6 +66,7 @@ struct Touch {
 std::vector<Touch> g_touches;
 float g_w = 1, g_h = 1;
 bool g_gamepad = false;  // the last input came from a controller: the drawn touch controls hide
+bool g_pad_connected = false;  // a controller is connected (platform_android.cpp polls the system's input devices)
 
 uint64_t key_to_button(int32_t k) {
     switch (k) {
@@ -228,6 +229,16 @@ void read_pad(PadState& p) {
     p.buttons &= ~kSettingsButton;
     // The settings screen takes the controller while it is open (and watches for its Minus + Plus combo).
     if (nx::ui::ui_pad(p.buttons, p.lx, p.ly)) p = PadState{};
+}
+
+// A controller connected: the touch controls hide at once (as on its first input); disconnected: they come back.
+void set_gamepad_connected(bool connected) {
+    std::lock_guard lk(g_in);
+    if (connected == g_pad_connected) return;
+    g_pad_connected = connected;
+    g_gamepad = connected;
+    nx::log("input: a controller %s: touch controls %s", connected ? "connected" : "disconnected",
+            connected ? "hidden" : "shown");
 }
 
 // The drawn layout's buttons (brighter while pressed) and the stick under the thumb; nothing while a controller is
