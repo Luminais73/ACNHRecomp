@@ -19,6 +19,7 @@ namespace nx::nvn {
 using namespace vk;
 
 VkQueue vk_queue();
+std::mutex& vk_queue_mutex();
 uint32_t vk_queue_family();
 
 namespace {
@@ -175,7 +176,7 @@ void debug_dump_textures(uint64_t frame) {
             si.pCommandBuffers = &cb;
             p_vkResetFences(d, 1, &fence);
             void* p = nullptr;
-            if (p_vkQueueSubmit(vk_queue(), 1, &si, fence) == VK_SUCCESS &&
+            if ((std::lock_guard<std::mutex>(vk_queue_mutex()), p_vkQueueSubmit(vk_queue(), 1, &si, fence)) == VK_SUCCESS &&
                 p_vkWaitForFences(d, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS &&
                 p_vkMapMemory(d, s.buffer_memory, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) {
                 char name[64];
@@ -210,7 +211,7 @@ void debug_dump_textures(uint64_t frame) {
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cb;
         p_vkResetFences(d, 1, &fence);
-        if (p_vkQueueSubmit(vk_queue(), 1, &si, fence) == VK_SUCCESS) {
+        if ((std::lock_guard<std::mutex>(vk_queue_mutex()), p_vkQueueSubmit(vk_queue(), 1, &si, fence)) == VK_SUCCESS) {
             p_vkWaitForFences(d, 1, &fence, VK_TRUE, UINT64_MAX);
             write_ppm(s, w, h, frame, texture);
         }
@@ -258,7 +259,7 @@ uint32_t frame_dump_every() {
 // at full speed until then, for glitches that only show in a long session (DEBUG-2 #77). Checked once a second.
 bool frame_dump_due(uint64_t presents) {
     static uint64_t left = 0, every = 2, next_check = 0;
-    if (presents >= next_check) {
+    if (presents >= next_check && plat::live_files()) {
         next_check = presents + 60;
         std::string path = plat::data_root() + "/dump_frames";
         if (FILE* f = plat::fopen_utf8(path, "rb")) {

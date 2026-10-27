@@ -99,6 +99,7 @@ void poll_live(std::vector<Scripted>& script) {
             std::rename(tmp.c_str(), out.c_str());
         }
     }
+    if (!live_files()) return;
     static const std::string path = data_root() + "/input_live";
     FILE* f = fopen_utf8(path, "rb");
     if (!f) return;

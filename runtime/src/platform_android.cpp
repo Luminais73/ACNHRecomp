@@ -271,13 +271,25 @@ void log_line(const char* line) { __android_log_write(ANDROID_LOG_INFO, nx::game
 std::string data_root() { return g_root; }
 
 std::string setting(const std::string& key) {
-    std::ifstream f(g_root + "/config.txt");
-    std::string line;
-    while (std::getline(f, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-        auto eq = line.find('=');
-        if (eq != std::string::npos && line.substr(0, eq) == key) return line.substr(eq + 1);
+    // config.txt read once (again only if the data folder changes): window_size asks for two settings every frame,
+    // and each read of the file (on shared storage, through FUSE) took milliseconds on the replay thread.
+    static std::mutex m;
+    static std::string read_root = "\n";
+    static std::vector<std::pair<std::string, std::string>> lines;
+    std::unique_lock lk(m);
+    if (read_root != g_root) {
+        read_root = g_root;
+        lines.clear();
+        std::ifstream f(g_root + "/config.txt");
+        std::string line;
+        while (std::getline(f, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            auto eq = line.find('=');
+            if (eq != std::string::npos) lines.emplace_back(line.substr(0, eq), line.substr(eq + 1));
+        }
     }
+    for (const auto& [k, v] : lines)
+        if (k == key) return v;
     // Else NX_<KEY>, as on the other platforms: what config.ini set through config_apply (the game language among
     // others: Android sent the game en-US whatever the settings said).
     std::string env = "NX_";
@@ -750,6 +762,7 @@ extern "C" void android_main(android_app* app) {
     }
     start_memory_guard();
     gpu_turbo();
+    root_clocks();
     app->onAppCmd = on_cmd;
     app->onInputEvent = on_input;
     // NX_SHOW_WHEN_LOCKED=1 (unattended test runs, tools/wonder_phone_course.sh): shown over the lock screen and turning

@@ -512,7 +512,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         if (!samples_wide) ui_x = g_uw.ax() < 1.0f ? g_uw.ax() : -g_uw.ay();
         static bool dbg_nosq = false;  // DEBUG: a file uw_nosqueeze turns the squeeze off while it exists
         static uint64_t dbg_next = 0;
-        if (g_stats.total >= dbg_next) {
+        if (g_stats.total >= dbg_next && plat::live_files()) {  // ~8 opens a frame: on a phone's FUSE, ms each
             dbg_next = g_stats.total + 3000;
             FILE* f = plat::fopen_utf8(plat::data_root() + "/uw_nosqueeze", "rb");
             dbg_nosq = f != nullptr;
@@ -562,7 +562,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         static uint64_t from = 0, n = 0, next_check = 0;
         static bool init = [&] { if (e) std::sscanf(e, "%lu:%lu", &from, &n); return true; }();
         (void)init;
-        if (g_stats.total >= next_check) {
+        if (g_stats.total >= next_check && plat::live_files()) {
             next_check = g_stats.total + 2000;
             std::string path = plat::data_root() + "/uw_trace";
             if (FILE* f = plat::fopen_utf8(path, "rb")) {

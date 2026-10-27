@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : require
 // Frame generation: motion vectors, by symmetric block matching around the frame halfway between the two (a vector v
 // at x matches prev(x - v/2) with cur(x + v/2)), so the in-between frame needs no splatting and has no holes.
 // A cell's cost is the sum of absolute luma differences over a 4x4 patch of luma texels around its centre (bilinear:
@@ -30,30 +31,42 @@ float best_c;
 bool coarse_taps;
 float dmean, best_dm;  // the patch's mean luma change (cur - prev): a fade, which the cost leaves out
 
-// Mean-removed: the differences' spread around their mean, so a fade or a flash still matches.
+// Mean-removed: the differences' spread around their mean, so a fade or a flash still matches. Two versions with
+// fixed loop bounds (unrolled: the differences stay in registers): with the patch size chosen at run time the array
+// was indexed dynamically, and Adreno's compiler kept it in memory (the search took ~3 ms a frame on an Adreno 650).
+float sad4(vec2 h) {  // the same 4x4 texels as 2x2 bilinear taps (means of 2x2), a quarter of the samples
+    float d[4];
+    float m = 0.0;
+    [[unroll]] for (int k = 0; k < 4; k++) {
+        vec2 o = vec2(float(k & 1) * 2.0 - 1.0, float(k >> 1) * 2.0 - 1.0);
+        d[k] = texture(lcur, (lc + o + h) * inv).r - texture(lprev, (lc + o - h) * inv).r;
+        m += d[k];
+    }
+    m *= 0.25;
+    float s = 0.0;
+    [[unroll]] for (int k = 0; k < 4; k++) s += abs(d[k] - m);
+    dmean = m;
+    return s * 4.0;
+}
+
+float sad16(vec2 h) {
+    float d[16];
+    float m = 0.0;
+    [[unroll]] for (int k = 0; k < 16; k++) {
+        vec2 o = vec2(float(k & 3) - 1.5, float(k >> 2) - 1.5);
+        d[k] = texture(lcur, (lc + o + h) * inv).r - texture(lprev, (lc + o - h) * inv).r;
+        m += d[k];
+    }
+    m *= 1.0 / 16.0;
+    float s = 0.0;
+    [[unroll]] for (int k = 0; k < 16; k++) s += abs(d[k] - m);
+    dmean = m;
+    return s;
+}
+
 float sad(vec2 v) {
     vec2 h = 0.5 * v / lscale;
-    float d[16];
-    int n = coarse_taps ? 4 : 16;
-    float m = 0.0;
-    if (coarse_taps) {  // the same 4x4 texels as 2x2 bilinear taps (means of 2x2), a quarter of the samples
-        for (int k = 0; k < 4; k++) {
-            vec2 o = vec2(float(k & 1) * 2.0 - 1.0, float(k >> 1) * 2.0 - 1.0);
-            d[k] = texture(lcur, (lc + o + h) * inv).r - texture(lprev, (lc + o - h) * inv).r;
-            m += d[k];
-        }
-    } else {
-        for (int k = 0; k < 16; k++) {
-            vec2 o = vec2(float(k & 3) - 1.5, float(k >> 2) - 1.5);
-            d[k] = texture(lcur, (lc + o + h) * inv).r - texture(lprev, (lc + o - h) * inv).r;
-            m += d[k];
-        }
-    }
-    m /= float(n);
-    float s = 0.0;
-    for (int k = 0; k < n; k++) s += abs(d[k] - m);
-    dmean = m;
-    return s * (16.0 / float(n));
+    return coarse_taps ? sad4(h) : sad16(h);
 }
 
 void try_v(vec2 v) {

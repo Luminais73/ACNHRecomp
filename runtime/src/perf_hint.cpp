@@ -16,8 +16,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include <nx/runtime.h>
@@ -93,6 +95,37 @@ void gpu_turbo() {
     // The descriptor stays open: the driver ties the setting to it.
 }
 
+// NX_ROOT_CLOCKS=1 (Android, rooted phones only; video.root_clocks in the settings): Samsung's system manager (SSRM)
+// caps the GPU through /sys/kernel/gpu/gpu_max_clock (441 of 587 MHz on a Galaxy S20 FE, even cold), which left the
+// game GPU-bound at ~25 fps. A root shell (su) puts the GPU's top clock back every few seconds, as SSRM sets it again.
+// The CPU caps are left alone: the replay did not get faster with them lifted (memory-bound), only hotter. Nothing
+// else is touched: the kernel's own thermal limits stay.
+void root_clocks() {
+    const char* e = std::getenv("NX_ROOT_CLOCKS");
+    if (!(e && e[0] == '1')) return;
+    std::thread([] {
+        set_thread_name("root clocks");
+        FILE* su = popen("su", "w");
+        if (!su) {
+            log("root clocks: su not available");
+            return;
+        }
+        log("root clocks: on (NX_ROOT_CLOCKS=1): the GPU's top clock kept available");
+        const char* cmd =
+            "G=/sys/kernel/gpu; K=/sys/class/kgsl/kgsl-3d0; "
+            "if [ -w $G/gpu_max_clock ] && [ -r $K/max_clock_mhz ]; then "
+            "m=$(cat $K/max_clock_mhz); [ \"$(cat $G/gpu_max_clock)\" = \"$m\" ] || echo $m > $G/gpu_max_clock; fi\n";
+        for (;;) {
+            if (std::fputs(cmd, su) < 0 || std::fflush(su) != 0) {
+                log("root clocks: the root shell ended");
+                pclose(su);
+                return;
+            }
+            sleep_ns(3'000'000'000ull);
+        }
+    }).detach();
+}
+
 void perf_hint_thread() {
     if (!api().ok) return;
     thread_local bool joined = false;
@@ -121,6 +154,7 @@ void perf_hint_frame(int64_t ns) {
 }
 #else
 void gpu_turbo() {}
+void root_clocks() {}
 void perf_hint_thread() {}
 void perf_hint_frame(int64_t) {}
 #endif

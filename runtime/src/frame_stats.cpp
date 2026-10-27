@@ -196,6 +196,15 @@ void request_performance_profile() {
 #endif
 }
 
+// A helper of the frame (the Vulkan recording thread, the presenter): with NX_AFFINITY, on the game main thread's cores.
+// Unplaced, the recorder ran on the little cores of a Snapdragon 865 and the replay waited for it at every submit.
+void frame_helper_tick() {
+#if defined(__ANDROID__)
+    thread_local uint32_t n = 0;
+    if (n++ % 256 == 0) place(1);
+#endif
+}
+
 uint64_t frame_thread_id(int role) { return g_role_tid[role & 1].load(std::memory_order_relaxed); }
 
 void frame_thread_tick(int role) {

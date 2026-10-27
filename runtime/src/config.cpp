@@ -117,6 +117,7 @@ const Mapping kMappings[] = {
     {"video.vsync", "NX_VSYNC", off_is_zero, true},
     {"video.shader_prepare", "NX_PIPE_PREWARM", off_is_zero, true},
     {"audio.reverb", "NX_AUDIO_REVERB", off_is_zero, false},  // also read live (hle_audio.cpp)
+    {"video.root_clocks", "NX_ROOT_CLOCKS", on_off, true},  // Android, rooted phones (perf_hint.cpp)
 };
 
 // video.preset: a named group of the settings that cost the most (measured on an M1, intro scene, GPU time per frame:

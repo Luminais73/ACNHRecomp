@@ -14,9 +14,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <condition_variable>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -40,6 +42,8 @@ using namespace nx::vk;
 namespace {
 
 std::recursive_mutex g_gpu;  // the whole GPU side: one submitting thread at a time
+std::mutex g_queue_mx;  // the queue: the presenter thread's vkQueuePresentKHR against the replay thread's submits
+VkResult presenter_idle();  // the presenter thread's pending present done (below)
 bool g_ready = false, g_failed = false;
 VkInstance g_instance = VK_NULL_HANDLE;
 VkPhysicalDevice g_physical = VK_NULL_HANDLE;
@@ -412,6 +416,7 @@ bool make_surface() {
 }
 
 bool make_swapchain() {
+    presenter_idle();
     ui::ui_swapchain_changed();
     if (g_swapchain) {
         if (async_gpu()) frame_wait_all();
@@ -431,7 +436,14 @@ bool make_swapchain() {
     if (!extent.width || !extent.height) return false;  // minimized
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = g_surface;
-    ci.minImageCount = std::max(caps.minImageCount, 3u);
+    // With frame generation two images are queued per game frame: with three, acquiring the next one waited for the
+    // display (~14 ms a frame on a Snapdragon 865), and the replay thread, which presents, could not go on with the
+    // next frame meanwhile. Five keep a free image. NX_SWAP_IMAGES: the count.
+    static const unsigned want = [] {
+        const char* e = std::getenv("NX_SWAP_IMAGES");
+        return e && std::atoi(e) > 0 ? unsigned(std::atoi(e)) : framegen_wanted() ? 5u : 3u;
+    }();
+    ci.minImageCount = std::max(caps.minImageCount, want);
     if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
     ci.imageFormat = g_sc_format;
     ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
@@ -484,7 +496,8 @@ bool make_swapchain() {
     }
     g_fifo = ci.presentMode == VK_PRESENT_MODE_FIFO_KHR;
     static const char* const mode_names[] = {"IMMEDIATE", "MAILBOX", "FIFO", "FIFO_RELAXED"};
-    log("nvn/vk: present mode %s (%u modes offered)", ci.presentMode <= 3 ? mode_names[ci.presentMode] : "?", modes_n);
+    log("nvn/vk: present mode %s (%u modes offered), %u images asked", ci.presentMode <= 3 ? mode_names[ci.presentMode] : "?",
+        modes_n, ci.minImageCount);
     ci.clipped = VK_TRUE;
     if (!check(p_vkCreateSwapchainKHR(g_device, &ci, nullptr, &g_swapchain), "vkCreateSwapchainKHR")) return false;
     uint32_t n = 0;
@@ -514,6 +527,7 @@ std::recursive_mutex& gpu_lock() { return g_gpu; }
 VkDevice vk_device() { return g_device; }
 VkPhysicalDevice vk_physical() { return g_physical; }
 VkQueue vk_queue() { return g_queue; }
+std::mutex& vk_queue_mutex() { return g_queue_mx; }
 uint32_t vk_queue_family() { return g_family; }
 bool vk_depth_clip_control() { return g_depth_clip_control; }
 bool vk_dynamic_rendering() { return g_dynamic_rendering; }
@@ -622,7 +636,11 @@ void end_and_wait(VkSemaphore wait, VkSemaphore signal) {
         si.pSignalSemaphores = &signal;
     }
     p_vkResetFences(g_device, 1, &g_fence);
-    bool queued = check(p_vkQueueSubmit(g_queue, 1, &si, g_fence), "vkQueueSubmit");
+    bool queued;
+    {
+        std::lock_guard q(g_queue_mx);
+        queued = check(p_vkQueueSubmit(g_queue, 1, &si, g_fence), "vkQueueSubmit");
+    }
     uint64_t t1 = plat::monotonic_ns();
     // 2 s at most: a frame's work takes milliseconds; longer is a shader that does not end.
     if (queued) {
@@ -865,19 +883,146 @@ void display_timing_log() {
     }
 }
 
+// ---- the presenter thread -----------------------------------------------------------------------------------------
+// On Android vkQueuePresentKHR does not return until the GPU has finished the image queued before (the BufferQueue
+// throttles an EGL/Vulkan producer to two queued buffers: "Throttling EGL Production"). With frame generation two
+// images go out per game frame, so the game frame's present waited for the generated one, that is for the whole
+// frame's GPU work: ~10 ms a frame on a Snapdragon 865 in which the replay thread did nothing. The game frame's
+// present is handed to this thread instead, and the replay goes on with the next frame. Everything else that uses the
+// queue or the swapchain first waits for that present to be done (presenter_wait), or holds the queue lock for its
+// submit (vkQueueSubmit and vkQueuePresentKHR on one queue must not overlap).
+// NX_PRESENT_THREAD=1/0: on/off (default: on Android with frame generation).
+struct PendingPresent {
+    VkFence before = VK_NULL_HANDLE;  // the image queued before it done on the GPU (g_gen_fence), or none
+    VkSemaphore rendered = VK_NULL_HANDLE;
+    uint32_t index = 0;
+    bool timing = false;
+    VkPresentTimeGOOGLE when{};
+};
+std::mutex g_pres_mx;
+std::condition_variable g_pres_cv;
+bool g_pres_pending = false, g_pres_done = true;
+PendingPresent g_pres_job;
+VkResult g_pres_result = VK_SUCCESS;
+// Signalled once the generated image queued before a game frame is done on the GPU: the presenter waits for it without
+// the queue lock, so that its vkQueuePresentKHR (throttled on that image) then holds the lock for a moment only, not
+// while the GPU finishes (the replay thread's next submit waited ~5 ms a frame for the lock).
+VkFence g_gen_fence = VK_NULL_HANDLE;
+bool g_gen_fence_used = false;
+
+bool presenter_wanted() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_PRESENT_THREAD");
+        if (e) return e[0] == '1';
+#if defined(__ANDROID__)
+        return framegen_wanted();
+#else
+        return false;
+#endif
+    }();
+    return on;
+}
+
+void presenter_main() {
+    plat::set_thread_name("vk presenter");
+    for (;;) {
+        PendingPresent job;
+        {
+            std::unique_lock lk(g_pres_mx);
+            g_pres_cv.wait(lk, [] { return g_pres_pending; });
+            job = g_pres_job;
+            g_pres_pending = false;
+        }
+        plat::frame_helper_tick();
+        if (job.before) {  // reset once signalled (a lost device: left as it is, nothing waits on it again)
+            VkResult w;
+            while ((w = p_vkWaitForFences(g_device, 1, &job.before, VK_TRUE, 1'000'000'000ull)) == VK_TIMEOUT) {}
+            if (w == VK_SUCCESS) p_vkResetFences(g_device, 1, &job.before);
+        }
+        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &job.rendered;
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &g_swapchain;  // not re-made while a present is pending (presenter_wait first)
+        pi.pImageIndices = &job.index;
+        VkPresentTimesInfoGOOGLE times{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
+        if (job.timing) times.swapchainCount = 1, times.pTimes = &job.when, pi.pNext = &times;
+        VkResult r;
+        {
+            std::lock_guard q(g_queue_mx);
+            r = p_vkQueuePresentKHR(g_queue, &pi);
+        }
+        std::lock_guard lk(g_pres_mx);
+        g_pres_result = r;
+        g_pres_done = true;
+        g_pres_cv.notify_all();
+    }
+}
+
+void after_present(VkResult r, bool real);
+
+// The handed-off present done. presenter_idle: only that (the swapchain is about to be re-made); presenter_wait: its
+// result acted on too. Before anything else touches the swapchain, or the queue without the queue lock.
+bool g_pres_unreaped = false;  // replay thread only
+VkResult presenter_idle() {
+    if (!g_pres_unreaped) return VK_SUCCESS;
+    g_pres_unreaped = false;
+    std::unique_lock lk(g_pres_mx);
+    g_pres_cv.wait(lk, [] { return g_pres_done && !g_pres_pending; });
+    return g_pres_result;
+}
+
+void presenter_wait() {
+    if (!g_pres_unreaped) return;
+    after_present(presenter_idle(), true);
+}
+
+void presenter_post(const PendingPresent& job) {
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(presenter_main).detach(); log("nvn/vk: game frames presented from their own thread (NX_PRESENT_THREAD)"); });
+    g_pres_unreaped = true;
+    std::lock_guard lk(g_pres_mx);
+    g_pres_job = job;
+    g_pres_pending = true;
+    g_pres_done = false;
+    g_pres_cv.notify_all();
+}
+
+// Where a present's time goes (acquire, recording, submit, vblank hold, vkQueuePresentKHR), logged every 600 presents.
+struct PresentParts {
+    uint64_t last = plat::monotonic_ns(), ns[5] = {};
+    void mark(int k) {
+        uint64_t now = plat::monotonic_ns();
+        ns[k] = now - last, last = now;
+    }
+    void done(bool real) {
+        static uint64_t sum[2][5], n[2];
+        for (int k = 0; k < 5; k++) sum[real][k] += ns[k];
+        if (++n[real] % 600) return;
+        log("nvn/vk: present (%s, ms each): acquire %.2f, record %.2f, submit %.2f, vblank hold %.2f, queue present %.2f",
+            real ? "game frames" : "generated", sum[real][0] / 6e8, sum[real][1] / 6e8, sum[real][2] / 6e8,
+            sum[real][3] / 6e8, sum[real][4] / 6e8);
+        for (auto& v : sum[real]) v = 0;
+    }
+};
+
 // One image to the swapchain: acquired, `record(cb, real)` (recorded first; returns the image to show, and whether it
 // is one of the game's frames: those are counted and dumped), the present pass or the blit of it, the settings screen,
 // the submit and the present.
 template <class Record>
 void present_image(const int32_t* crop, Record&& record) {
+    presenter_wait();
+    if (!g_swapchain) return;
     uint32_t index = 0;
     VkSemaphore acquired = async_gpu() ? frame_acquire_semaphore() : g_acquired;
+    PresentParts parts;
     VkResult r = p_vkAcquireNextImageKHR(g_device, g_swapchain, UINT64_MAX, acquired, VK_NULL_HANDLE, &index);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         make_swapchain();
         return;
     }
     if (!check(r, "vkAcquireNextImageKHR") || !begin()) return;
+    parts.mark(0);
     gpu_busy_note_pass("present (frame generation, scaling, overlay)");  // NX_GPU_PROFILE=3: its own label
     bool real = true;
     GpuImage* src = record(g_cb, real);
@@ -940,10 +1085,23 @@ void present_image(const int32_t* crop, Record&& record) {
     if (dump) transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);  // the present pass left it sampled
     dump = dump && frame_dump_record(g_cb, *src);
     VkSemaphore rendered = async_gpu() ? frame_rendered_semaphore(index) : g_rendered;
+    parts.mark(1);
     if (async_gpu())  // the blit's fence is not waited for (vkQueuePresentKHR waits on `rendered`); a dumped frame is
         frame_submit(acquired, rendered, {}, dump);
     else
         end_and_wait(acquired, rendered);
+    if (!real && presenter_wanted()) {  // a fence behind the generated image (see g_gen_fence)
+        if (!g_gen_fence) {
+            VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            p_vkCreateFence(g_device, &fci, nullptr, &g_gen_fence);
+        } else if (g_gen_fence_used) {  // the last one's game frame was not presented (minimized): not reset yet
+            p_vkWaitForFences(g_device, 1, &g_gen_fence, VK_TRUE, UINT64_MAX);
+            p_vkResetFences(g_device, 1, &g_gen_fence);
+        }
+        std::lock_guard q(g_queue_mx);
+        g_gen_fence_used = g_gen_fence && p_vkQueueSubmit(g_queue, 0, nullptr, g_gen_fence) == VK_SUCCESS;
+    }
+    parts.mark(2);
     if (dump && due) frame_dump_write(*src, presents);
     if (due) debug_dump_textures(presents);
     bool shown_now = false;
@@ -953,24 +1111,37 @@ void present_image(const int32_t* crop, Record&& record) {
         picture = (dump && probe && frame_readback_lit(*src)) || plat::monotonic_ns() - first_ns > 60'000'000'000ull;
         shown_now = picture;
     }
-    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-    pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &rendered;
-    pi.swapchainCount = 1;
-    pi.pSwapchains = &g_swapchain;
-    pi.pImageIndices = &index;
     VkPresentTimeGOOGLE when{uint32_t(display_timing_next(real)), 0};
-    VkPresentTimesInfoGOOGLE times{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
-    if (g_display_timing) times.swapchainCount = 1, times.pTimes = &when, pi.pNext = &times;
     if (real) vblank_hold();  // on the display's vblank its interval asks for (hle_vi.cpp)
-    r = p_vkQueuePresentKHR(g_queue, &pi);
-    if (g_display_timing && real) display_timing_log();
+    parts.mark(3);
+    if (real && presenter_wanted()) {
+        presenter_post({g_gen_fence_used ? g_gen_fence : VK_NULL_HANDLE, rendered, index, bool(g_display_timing), when});
+        g_gen_fence_used = false;
+    } else {
+        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &rendered;
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &g_swapchain;
+        pi.pImageIndices = &index;
+        VkPresentTimesInfoGOOGLE times{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
+        if (g_display_timing) times.swapchainCount = 1, times.pTimes = &when, pi.pNext = &times;
+        std::lock_guard q(g_queue_mx);
+        r = p_vkQueuePresentKHR(g_queue, &pi);
+    }
+    parts.mark(4);
+    parts.done(real);
     if (real) plat::frame_presented();  // cores, CPU time, present intervals (frame_stats.cpp)
     if (shown_now) {
         log("nvn/vk: first picture at present %llu", (unsigned long long)presents);
         plat::picture_shown();
         ui::ui_picture_shown();
     }
+    if (!g_pres_unreaped) after_present(r, real);  // else when it is done (presenter_wait)
+}
+
+void after_present(VkResult r, bool real) {
+    if (g_display_timing && real) display_timing_log();
     // SUBOPTIMAL re-makes the swapchain only when the surface size changed: Android returns it for every present when
     // the swapchain's transform is not the display's (a Galaxy S23 did for Hades), a rebuild per frame.
     bool remake = r == VK_ERROR_OUT_OF_DATE_KHR;
@@ -1014,6 +1185,7 @@ void gpu_present(uint64_t texture, const int32_t* crop, int interval) {
     if (plat::headless()) return present_headless(texture);
     if (plat::window_minimized()) return;
     if (plat::window_generation() != g_window_gen) {  // Android: a new window after home or the lock screen
+        presenter_idle();
         if (async_gpu()) frame_wait_all();
         p_vkDeviceWaitIdle(g_device);
         present_pass_release();

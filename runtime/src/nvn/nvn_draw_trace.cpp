@@ -31,7 +31,7 @@ LiveDebug& live_debug() {
     static LiveDebug d;
     static uint64_t next_check = 0;
     uint64_t frame = g_frame.load(std::memory_order_relaxed);
-    if (frame >= next_check) {
+    if (frame >= next_check && plat::live_files()) {
         next_check = frame + 30;
         std::string root = plat::data_root();
         if (FILE* f = plat::fopen_utf8(root + "/trace_draws", "rb")) {

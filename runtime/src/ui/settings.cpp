@@ -429,6 +429,9 @@ void page_video() {
     });
     row("video.shaders", "video.shaders.desc", [&](float w) { toggle("video.shader_prepare", true, w); });
     row("video.async_shaders", "video.async_shaders.desc", [&](float w) { toggle("video.async_shaders", false, w); });
+#if defined(__ANDROID__)
+    row("video.root_clocks", "video.root_clocks.desc", [&](float w) { toggle("video.root_clocks", false, w); });
+#endif
 }
 
 void page_audio() {

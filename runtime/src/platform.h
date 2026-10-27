@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 namespace nx::plat {
@@ -112,10 +113,12 @@ void set_gamepad_connected(bool connected);  // Android: a controller connected 
 // a frame's work took `ns`.
 void perf_hint_thread();
 void perf_hint_frame(int64_t ns);
-void gpu_turbo();  // NX_GPU_TURBO=1: the Adreno GPU at its highest clock (perf_hint.cpp; Android)
+void gpu_turbo();
+void root_clocks();  // NX_ROOT_CLOCKS=1: a rooted Samsung phone's GPU clock cap lifted (perf_hint.cpp; Android)  // NX_GPU_TURBO=1: the Adreno GPU at its highest clock (perf_hint.cpp; Android)
 // Frame threads and present intervals (frame_stats.cpp): the cores they run on, their CPU time, NX_AFFINITY.
 // role 0: the thread that replays and presents (frame_presented ticks it); 1: the game's main thread.
 void frame_thread_tick(int role);
+void frame_helper_tick();  // a helper thread of the frame, placed with the game main thread (NX_AFFINITY)
 // The host thread id of a role (0 replay+present, 1 game main) as last seen by frame_thread_tick, 0 before (sampler.cpp).
 uint64_t frame_thread_id(int role);
 void frame_presented();  // after each present to the display
@@ -131,6 +134,21 @@ bool write_watch_fault(void* at);
 // NX_HEADLESS=1: no visible window (it is created hidden) and nothing presented; frames still render and
 // NX_DUMP_FRAMES still writes them. For unattended test runs.
 bool headless();
+// Debug and test files polled in the data folder while the game runs (input_live, dump_frames, trace_cmds,
+// trace_draws, skip_fs, uw_probe, uw_cams). On Android the data folder is on shared storage (FUSE): each check of a
+// file that is not there took milliseconds, on the replay thread (~15% of its time on a Snapdragon 865). There they are
+// off unless NX_LIVE=1 or a test run (NX_LIVE_FRAME); elsewhere on unless NX_LIVE=0.
+inline bool live_files() {
+    static const bool on = [] {
+        if (const char* e = std::getenv("NX_LIVE")) return e[0] == '1';
+#if defined(__ANDROID__)
+        return std::getenv("NX_LIVE_FRAME") != nullptr;
+#else
+        return true;
+#endif
+    }();
+    return on;
+}
 // Ends the process when its memory footprint passes NX_MEM_LIMIT_GB (default 8); logs it every 30 s (macOS).
 void start_memory_guard();
 // How much of [from, to) (monotonic ns) the memory guard spent reading (memguard_android.cpp; 0 elsewhere).

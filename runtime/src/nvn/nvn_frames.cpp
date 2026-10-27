@@ -47,6 +47,7 @@ namespace nx::nvn {
 using namespace nx::vk;
 
 VkQueue vk_queue();                // nvn_vk.cpp
+std::mutex& vk_queue_mutex();      // nvn_vk.cpp: held around vkQueueSubmit (the presenter thread presents on the queue)
 std::recursive_mutex& gpu_lock();  // nvn_vk.cpp
 
 namespace {
@@ -377,7 +378,11 @@ bool submit_part(VkCommandBuffer cb, VkFence fence, VkSemaphore wait, VkSemaphor
         si.pSignalSemaphores = &signal;
     }
     p_vkResetFences(vk_device(), 1, &fence);
-    VkResult r = p_vkQueueSubmit(vk_queue(), 1, &si, fence);
+    VkResult r;
+    {
+        std::lock_guard q(vk_queue_mutex());
+        r = p_vkQueueSubmit(vk_queue(), 1, &si, fence);
+    }
     g_times.encode_ns += plat::monotonic_ns() - t0;
     if (r == VK_ERROR_DEVICE_LOST) gpu_hung("vkQueueSubmit");
     if (r != VK_SUCCESS) log("nvn/vk: vkQueueSubmit failed (%d)", int(r));

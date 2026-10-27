@@ -57,7 +57,7 @@ void window_px(uint64_t present, uint32_t& w, uint32_t& h) {
     plat::window_size(w, h);
     static uint32_t live_w = 0, live_h = 0;
     static uint64_t next_live = 0;
-    if (uint64_t now = plat::monotonic_ns(); now >= next_live) {
+    if (uint64_t now = plat::monotonic_ns(); now >= next_live && plat::live_files()) {
         next_live = now + 1'000'000'000;
         unsigned lw = 0, lh = 0;
         if (FILE* f = plat::fopen_utf8(plat::data_root() + "/window_size", "rb")) {
@@ -495,7 +495,7 @@ void uw_cameras(uint64_t present) {
     uw_update(present);
     {  // DEBUG: a file uw_cams: every sead::PerspectiveProjection / OrthoProjection on the heap, once
         static uint64_t next = 0;
-        if (uint64_t now = plat::monotonic_ns(); now >= next) {
+        if (uint64_t now = plat::monotonic_ns(); now >= next && plat::live_files()) {
             next = now + 1'000'000'000;
             std::string path = plat::data_root() + "/uw_cams";
             if (FILE* fp = plat::fopen_utf8(path, "rb")) {
@@ -624,7 +624,7 @@ void pane_calculate(CPU& c) {
         static uint64_t next = 0, calls = 0;
         static std::mutex m;
         std::lock_guard lk(m);
-        if (uint64_t now = plat::monotonic_ns(); now >= next) {
+        if (uint64_t now = plat::monotonic_ns(); now >= next && plat::live_files()) {
             next = now + 1'000'000'000;
             std::memset(probe, 0, sizeof probe);
             if (FILE* fp = plat::fopen_utf8(plat::data_root() + "/uw_probe", "rb")) {
