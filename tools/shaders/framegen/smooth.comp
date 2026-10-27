@@ -1,7 +1,10 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : require
 // Frame generation: the vector field's outliers removed. Each cell takes the vector median of its 3x3 neighbourhood
 // (the one closest, in summed distance, to the other eight), which keeps motion edges where a mean would blur them.
-// Cells that found no good match are counted (a scene cut makes most of them so: synth.comp then cross-fades).
+// Cells that found no good match are counted (a scene cut makes most of them so: synth.comp then cross-fades): per
+// group in shared memory, then one atomic per group (one per cell serialised thousands of atomics on one texel when
+// water, foliage or a cut left most cells unmatched).
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D src;
 layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D dst;
@@ -12,19 +15,35 @@ layout(push_constant) uniform P {
     vec4 b;
 } p;
 
+shared uint group_unmatched;
+
 void main() {
     ivec2 q = ivec2(gl_GlobalInvocationID.xy);
-    if (any(greaterThanEqual(q, imageSize(dst)))) return;
-    ivec2 last = textureSize(src, 0) - 1;
-    vec4 v[9];
-    for (int k = 0; k < 9; k++) v[k] = texelFetch(src, clamp(q + ivec2(k % 3 - 1, k / 3 - 1), ivec2(0), last), 0);
-    int best = 4;
-    float best_d = 1e30;
-    for (int k = 0; k < 9; k++) {
-        float d = 0.0;
-        for (int m = 0; m < 9; m++) d += length(v[k].xy - v[m].xy);
-        if (d < best_d - 1e-3) best_d = d, best = k;
+    bool first = gl_LocalInvocationIndex == 0;
+    if (first) group_unmatched = 0;
+    barrier();
+    if (all(lessThan(q, imageSize(dst)))) {
+        ivec2 last = textureSize(src, 0) - 1;
+        vec4 v[9];
+        [[unroll]] for (int k = 0; k < 9; k++)
+            v[k] = texelFetch(src, clamp(q + ivec2(k % 3 - 1, k / 3 - 1), ivec2(0), last), 0);
+        // Distances are symmetric: 36 pairs, not 81.
+        float d[9] = float[9](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        [[unroll]] for (int k = 0; k < 9; k++)
+            [[unroll]] for (int m = k + 1; m < 9; m++) {
+                float e = length(v[k].xy - v[m].xy);
+                d[k] += e, d[m] += e;
+            }
+        int best = 4;
+        float best_d = 1e30;
+        [[unroll]] for (int k = 0; k < 9; k++)
+            if (d[k] < best_d - 1e-3) best_d = d[k], best = k;
+        vec4 o = v[4];
+        [[unroll]] for (int k = 0; k < 9; k++)
+            if (k == best) o.xy = v[k].xy;
+        imageStore(dst, q, o);  // the cell's own cost and luma change
+        if (v[4].z > p.a.x || abs(v[4].w) > p.a.y) atomicAdd(group_unmatched, 1u);
     }
-    imageStore(dst, q, vec4(v[best].xy, v[4].zw));  // the cell's own cost and luma change
-    if (v[4].z > p.a.x || abs(v[4].w) > p.a.y) imageAtomicAdd(unmatched, ivec2(0), 1u);
+    barrier();
+    if (first && group_unmatched != 0) imageAtomicAdd(unmatched, ivec2(0), group_unmatched);
 }

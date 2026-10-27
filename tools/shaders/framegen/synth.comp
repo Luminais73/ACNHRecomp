@@ -4,11 +4,13 @@
 // best, and shows the average of those ends. A pixel that did not change at all (HUD, still scenery) is copied as is,
 // so it stays sharp. Where no vector fits (something uncovered), the result leans to the plain cross-fade of the two
 // frames, and after a scene cut (most cells unmatched) the whole frame is that cross-fade.
+// Colours and errors are mediump (8-bit colours; Adreno: half registers, so more waves to hide the fetches, and
+// double-rate ALU); pixel positions stay highp.
 layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 0) uniform sampler2D prevc;
-layout(set = 0, binding = 1) uniform sampler2D curc;
+layout(set = 0, binding = 0) uniform mediump sampler2D prevc;
+layout(set = 0, binding = 1) uniform mediump sampler2D curc;
 layout(set = 0, binding = 2) uniform sampler2D field;
-layout(set = 0, binding = 4, rgba8) uniform writeonly image2D dst;
+layout(set = 0, binding = 4, rgba8) uniform writeonly mediump image2D dst;
 layout(set = 0, binding = 5, r32ui) uniform readonly uimage2D unmatched;  // smooth.comp's count
 layout(push_constant) uniform P {
     ivec4 size;  // xy: the image's size; z: the unmatched cells above which the frame cross-fades (a scene cut)
@@ -17,15 +19,15 @@ layout(push_constant) uniform P {
 } p;
 
 vec2 px, inv;
-vec3 best_col;
-float best_e, dm;  // dm: the local luma change (cur - prev), a fade: left out of the comparisons
+mediump vec3 best_col;
+mediump float best_e, dm;  // dm: the local luma change (cur - prev), a fade: left out of the comparisons
 
-float err(vec3 a, vec3 b) { return dot(abs(a + dm - b), vec3(0.3333)); }
+mediump float err(mediump vec3 a, mediump vec3 b) { return dot(abs(a + dm - b), vec3(0.3333)); }
 
-void try_v(vec2 v, float bias) {
-    vec3 a = texture(prevc, (px - 0.5 * v) * inv).rgb;
-    vec3 b = texture(curc, (px + 0.5 * v) * inv).rgb;
-    float e = err(a, b) + bias;
+void try_v(vec2 v, mediump float bias) {
+    mediump vec3 a = texture(prevc, (px - 0.5 * v) * inv).rgb;
+    mediump vec3 b = texture(curc, (px + 0.5 * v) * inv).rgb;
+    mediump float e = err(a, b) + bias;
     if (e < best_e) best_e = e, best_col = 0.5 * (a + b);
 }
 
@@ -37,7 +39,7 @@ bool cut;
 void pixel(ivec2 q, ivec2 base) {
     if (any(greaterThanEqual(q, p.size.xy))) return;
     px = vec2(q) + 0.5;
-    vec3 a0 = texelFetch(prevc, q, 0).rgb, b0 = texelFetch(curc, q, 0).rgb;
+    mediump vec3 a0 = texelFetch(prevc, q, 0).rgb, b0 = texelFetch(curc, q, 0).rgb;
     dm = 0.0;
     if (err(a0, b0) < 1.5 / 255.0 || cut) {
         imageStore(dst, q, vec4(0.5 * (a0 + b0), 1.0));
@@ -45,7 +47,7 @@ void pixel(ivec2 q, ivec2 base) {
     }
     vec2 f = px / p.a.x - 0.5;
     ivec2 i0 = ivec2(floor(f)) - base;
-    vec2 w = f - floor(f);
+    mediump vec2 w = f - floor(f);
     vec3 c00 = cells[i0.y][i0.x], c10 = cells[i0.y][i0.x + 1];
     vec3 c01 = cells[i0.y + 1][i0.x], c11 = cells[i0.y + 1][i0.x + 1];
     vec3 cb = mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
@@ -59,13 +61,16 @@ void pixel(ivec2 q, ivec2 base) {
     best_col = 0.5 * (a0 + b0);
     try_v(vb, 0.0);
     // The cells' own vectors where they differ and the interpolated one does not fit (motion edges): this bounds
-    // the cost, most moving pixels take the first.
-    float spread = max(max(length(c00.xy - vb), length(c10.xy - vb)), max(length(c01.xy - vb), length(c11.xy - vb)));
-    if (spread > 0.75 && best_e > 0.02) {
-        try_v(c00.xy, 0.01);
-        try_v(c10.xy, 0.01);
-        try_v(c01.xy, 0.01);
-        try_v(c11.xy, 0.01);
+    // the cost, most moving pixels take the first. A vector already tried (the interpolated one where the cells
+    // agree, or another corner's) would cost the same or more and not be taken: skipped, two fetches each.
+    if (best_e > 0.02) {
+        float spread = max(max(length(c00.xy - vb), length(c10.xy - vb)), max(length(c01.xy - vb), length(c11.xy - vb)));
+        if (spread > 0.75) {
+            if (c00.xy != vb) try_v(c00.xy, 0.01);
+            if (c10.xy != vb && c10.xy != c00.xy) try_v(c10.xy, 0.01);
+            if (c01.xy != vb && c01.xy != c00.xy && c01.xy != c10.xy) try_v(c01.xy, 0.01);
+            if (c11.xy != vb && c11.xy != c00.xy && c11.xy != c10.xy && c11.xy != c01.xy) try_v(c11.xy, 0.01);
+        }
     }
     // No vector makes the two ends agree (something uncovered, or effects that do not move): towards the plain
     // cross-fade, which at least does not tear.

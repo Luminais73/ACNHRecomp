@@ -5,13 +5,14 @@
 // in-between frame is drawn and presented at once, and N follows half a game frame later (nvn_vk.cpp). The cost is
 // that half frame of latency, plus the GPU time below. Everything is compute work on the presented image, before the
 // present pass (so FSR or the plain scaling apply to both frames alike):
-//   1. luma.comp: N's luma at 1/4, 1/8 and 1/16 (one pass); down.comp: 1/32. N-1 is read from its own window
-//      texture (not copied: see framegen_record), its luma kept from the last time.
+//   1. luma.comp: N's luma at 1/4, 1/8, 1/16 and 1/32 (one pass). N-1 is read from its own window texture (not
+//      copied: see framegen_record), its luma kept from the last time.
 //   2. search.comp: motion vectors by symmetric block matching (the vector v at x pairs N-1 at x - v/2 with N at
 //      x + v/2: vectors of the in-between frame itself, no holes), coarse to fine: a full search at 1/32 (+-96 px),
 //      then a vector per 16x16 pixels, refined on the 1/8 and 1/4 luma down to a pixel (each pass takes the last
 //      one's vectors of the cell and its neighbours as candidates). The last frame's field is a candidate too. The
-//      cost leaves out the patch's mean change, so fades still match.
+//      cost leaves out the patch's mean change, so fades still match. A cell whose match is already near perfect is
+//      not refined further (still, flat or steadily moving areas: most of the search's cost on a phone).
 //   3. smooth.comp: a 3x3 vector median; cells without a good match are counted.
 //   4. synth.comp: per pixel, the best-agreeing of a few nearby vectors; unchanged pixels (HUD, still scenery) are
 //      copied as they are; no good vector: the plain cross-fade; most cells unmatched (a scene cut): all of it.
@@ -34,7 +35,7 @@ namespace {
 
 #include "nvn_framegen_spirv.inc"
 
-enum Pass { kLuma, kDown, kSearch, kSmooth, kSynth, kPassCount };
+enum Pass { kLuma, kSearch, kSmooth, kSynth, kPassCount };
 
 struct Push {
     int32_t size[4];
@@ -181,8 +182,8 @@ bool init() {
     struct Code {
         const uint32_t* words;
         size_t bytes;
-    } code[kPassCount] = {{kFgLuma, sizeof kFgLuma}, {kFgDown, sizeof kFgDown}, {kFgSearch, sizeof kFgSearch},
-                          {kFgSmooth, sizeof kFgSmooth}, {kFgSynth, sizeof kFgSynth}};
+    } code[kPassCount] = {{kFgLuma, sizeof kFgLuma}, {kFgSearch, sizeof kFgSearch}, {kFgSmooth, sizeof kFgSmooth},
+                          {kFgSynth, sizeof kFgSynth}};
     for (int k = 0; k < kPassCount; k++) {
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mi.codeSize = code[k].bytes, mi.pCode = code[k].words;
@@ -356,8 +357,7 @@ GpuImage* framegen_record(VkCommandBuffer cb, uint64_t texture, GpuImage& src, b
     GpuImage(&P)[4] = g.luma[old];
     Push p{};
     p.size[0] = int32_t(w), p.size[1] = int32_t(h);
-    dispatch(cb, kLuma, {{0, &src}, {5, &L[0]}, {6, &L[1]}, {7, &L[2]}}, p, div_up(w, 32), div_up(h, 32));
-    dispatch(cb, kDown, {{0, &L[2]}, {4, &L[3]}}, p, div_up(L[3].width, 8), div_up(L[3].height, 8));
+    dispatch(cb, kLuma, {{0, &src}, {4, &L[3]}, {5, &L[0]}, {6, &L[1]}, {7, &L[2]}}, p, div_up(w, 32), div_up(h, 32));
     g.cur = cur;
     g.have_prev = true;
     if (!generate) {
@@ -368,22 +368,27 @@ GpuImage* framegen_record(VkCommandBuffer cb, uint64_t texture, GpuImage& src, b
     // Coarse to fine. a: full pixels per field cell, per luma texel, per coarser cell, per temporal cell;
     // b: the refinement steps (luma texels), from x halving down to y. 1/32: +-3 texels (+-96 px; the last frame's
     // vector covers faster motion); then 16x16-pixel cells on the 1/8 luma (16, 8, 4 px) and the 1/4 (4, 2, 1 px).
-    // b.z: the coarse passes compare 2x2 taps (means of 2x2 texels), the last one every texel.
+    // b.z: the coarse passes compare 2x2 taps (means of 2x2 texels), the last one every texel. b.w: the cost below
+    // which a cell's vector is not refined further, last pass only: a mean difference of 1/400 over its 16 texels
+    // (about 0.6 of an 8-bit level; noise and sub-pixel resampling leave more than that on textured moving areas,
+    // so only matches that refining could not visibly improve stop early). Not on the coarse levels: their box-
+    // averaged luma can match that well a vector still 16 px off, which the last pass's +-7 px would not undo.
+    constexpr float kGoodEnough = 0.04f;
     struct Level {
         int mode;
         GpuImage *lprev, *lcur, *coarse, *out;
-        float a[4], b[3];
+        float a[4], b[4];
     } levels[] = {
-        {0, &P[3], &L[3], nullptr, &g.field[0], {32, 32, 0, 16}, {0.5f, 0.5f, 1}},
-        {1, &P[1], &L[1], &g.field[0], &g.field[1], {16, 8, 32, 16}, {2, 0.5f, 1}},
-        {2, &P[0], &L[0], &g.field[1], &g.fine, {16, 4, 16, 16}, {1, 0.25f, 0}},
+        {0, &P[3], &L[3], nullptr, &g.field[0], {32, 32, 0, 16}, {0.5f, 0.5f, 1, 0}},
+        {1, &P[1], &L[1], &g.field[0], &g.field[1], {16, 8, 32, 16}, {2, 0.5f, 1, 0}},
+        {2, &P[0], &L[0], &g.field[1], &g.fine, {16, 4, 16, 16}, {1, 0.25f, 0, kGoodEnough}},
     };
     GpuImage& temporal = g.final_[old];
     for (const Level& l : levels) {
         Push q{};
         q.size[0] = l.mode, q.size[1] = 3, q.size[2] = g.have_field ? 1 : 0;
         std::memcpy(q.a, l.a, sizeof q.a);
-        q.b[0] = l.b[0], q.b[1] = l.b[1], q.b[2] = l.b[2];
+        std::memcpy(q.b, l.b, sizeof q.b);
         GpuImage* coarse = l.coarse ? l.coarse : &temporal;  // mode 0 reads no coarser field
         dispatch(cb, kSearch, {{0, l.lprev}, {1, l.lcur}, {2, coarse}, {3, &temporal}, {4, l.out}}, q,
                  div_up(l.out->width, 8), div_up(l.out->height, 8));
