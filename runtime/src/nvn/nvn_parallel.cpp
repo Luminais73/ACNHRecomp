@@ -9,6 +9,10 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <cerrno>
+#include <sys/resource.h>
+#include <unistd.h>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -195,7 +199,7 @@ struct Stats {
     uint64_t submits = 0, regions = 0, jobs = 0, bails = 0, parallel_draws = 0, serial_draws = 0;
     uint64_t walk_ns = 0, wait_ns = 0, queue_ns = 0, bail_ns = 0, own_job_ns = 0;
     uint64_t flatten_ns = 0, region_ns = 0, serial_ns = 0, ordered_ns = 0, total_ns = 0;
-    std::atomic<uint64_t> job_ns{0}, worker_job_ns{0};
+    std::atomic<uint64_t> job_ns{0}, worker_job_ns{0}, worker_cpu_ns{0};
 } g_pstats;
 const char* g_bail_why = nullptr;  // the first reason of the last window, for the log
 
@@ -213,8 +217,14 @@ bool ordered(const Cmd& c) {
     }
 }
 
+uint64_t thread_cpu_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
+
 void run_job(Job& j, int w) {
-    const uint64_t t0 = plat::monotonic_ns();
+    const uint64_t t0 = plat::monotonic_ns(), c0 = thread_cpu_ns();
     (*t_parallel_worker) = true, (*t_bail) = false;
     (*t_worker_slot) = g_slot, (*t_worker_index) = w;
     (*t_clear_once_skip) = &g_skip;
@@ -239,7 +249,10 @@ void run_job(Job& j, int w) {
     j.bailed = (*t_bail) || !cb;
     const uint64_t ns = plat::monotonic_ns() - t0;
     g_pstats.job_ns.fetch_add(ns, std::memory_order_relaxed);
-    if (w != g_workers) g_pstats.worker_job_ns.fetch_add(ns, std::memory_order_relaxed);
+    if (w != g_workers) {
+        g_pstats.worker_job_ns.fetch_add(ns, std::memory_order_relaxed);
+        g_pstats.worker_cpu_ns.fetch_add(thread_cpu_ns() - c0, std::memory_order_relaxed);
+    }
     (*t_parallel_worker) = false, (*t_bail) = false;
     (*t_clear_once_skip) = nullptr;
 }
@@ -266,6 +279,14 @@ void worker_main(int w) {
     plat::set_thread_name("nvn replay w");
 #if defined(__aarch64__) && defined(__ANDROID__)
     g_replay_tp[w + 1] = thread_pointer();  // its own slot of the per-thread state (nvn_per_thread.h)
+    // Ahead of the game's other threads on the big cores: at the default priority the workers spent ~40% of their
+    // chunks' time preempted (S20 FE). NX_PARALLEL_NICE: the nice value (Android lets an app go down to -19).
+    {
+        const char* e = std::getenv("NX_PARALLEL_NICE");
+        int nice = e ? std::atoi(e) : -19;
+        int r = setpriority(PRIO_PROCESS, int(gettid()), nice);
+        if (w == 0) log("nvn/vk: parallel replay workers at nice %d (%s)", nice, r == 0 ? "ok" : std::strerror(errno));
+    }
 #endif
     uint64_t seen = 0;
     for (;;) {
@@ -464,13 +485,14 @@ void parallel_replay(VkCommandBuffer& cb, Targets& st, const std::vector<std::sh
         auto ms = [&](uint64_t ns) { return double(ns) / 1e6 / s; };
         log("nvn/vk: parallel replay: per submit %.1f regions, %.1f chunks, %.2f bailed%s%s; %.0f draws in parallel, %.0f "
             "on the replay thread; ms: walk %.2f, own chunks %.2f, wait %.2f, bailed chunks %.2f, all chunks %.2f (workers "
-            "%.2f)", double(g_pstats.regions) / s, double(g_pstats.jobs) / s, double(g_pstats.bails) / s,
+            "%.2f, on the CPU %.2f)", double(g_pstats.regions) / s, double(g_pstats.jobs) / s, double(g_pstats.bails) / s,
             g_bail_why ? " first: " : "", g_bail_why ? g_bail_why : "", double(g_pstats.parallel_draws) / s,
             double(g_pstats.serial_draws) / s, ms(g_pstats.walk_ns), ms(g_pstats.own_job_ns), ms(g_pstats.wait_ns),
-            ms(g_pstats.bail_ns), ms(g_pstats.job_ns.load()), ms(g_pstats.worker_job_ns.load()));
+            ms(g_pstats.bail_ns), ms(g_pstats.job_ns.load()), ms(g_pstats.worker_job_ns.load()),
+            ms(g_pstats.worker_cpu_ns.load()));
         g_pstats.submits = g_pstats.regions = g_pstats.jobs = g_pstats.bails = g_pstats.parallel_draws = 0;
         g_pstats.serial_draws = g_pstats.walk_ns = g_pstats.wait_ns = g_pstats.queue_ns = g_pstats.bail_ns = 0;
-        g_pstats.own_job_ns = 0, g_pstats.job_ns = 0, g_pstats.worker_job_ns = 0;
+        g_pstats.own_job_ns = 0, g_pstats.job_ns = 0, g_pstats.worker_job_ns = 0, g_pstats.worker_cpu_ns = 0;
         log("nvn/vk: parallel replay ms per submit: total %.2f = flatten %.2f + regions %.2f + serial %.2f + ordered %.2f",
             ms(g_pstats.total_ns), ms(g_pstats.flatten_ns), ms(g_pstats.region_ns), ms(g_pstats.serial_ns),
             ms(g_pstats.ordered_ns));
