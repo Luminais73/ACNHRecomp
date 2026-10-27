@@ -8,6 +8,14 @@
 #include <cstdlib>
 #include <string>
 
+// The runtime's functions and variables the recompiled code calls (cpu.h, runtime.h, the generated funcs.h). On
+// Android the game's code is its own library (lib<game>_game.so) and these are exported to it from the app's.
+#if defined(__GNUC__) || defined(__clang__)
+#define NX_GAME_API __attribute__((visibility("default")))
+#else
+#define NX_GAME_API
+#endif
+
 namespace nx::plat {
 
 // ---- memory: fixed-address reservations (guest pointers are host pointers) ----

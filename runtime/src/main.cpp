@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include <nx/game.h>
 #include <nx/runtime.h>
@@ -13,16 +14,26 @@
 #include "kernel.h"
 #include "platform.h"
 
+#ifdef NX_GAME_DYNAMIC
+// Android: the modules' tables are in lib<game>_game.so, loaded by the platform before boot (platform_android.cpp).
+namespace nx::plat {
+const nx::ModuleInfo* game_module(const char* name);
+[[noreturn]] void game_longjmp(uint64_t buf, uint64_t val);
+}
+#define nx_module_main (*nx::plat::game_module("main"))
+#define nx_module_sdk (*nx::plat::game_module("sdk"))
+#else
 extern const nx::ModuleInfo nx_module_main;
 extern const nx::ModuleInfo nx_module_sdk;
 #ifdef NX_HAS_SUBSDK0
 // ACNH: subsdk0 is SDK_movie (nn::movie), imported by main. Recompiled like main and sdk.
 extern const nx::ModuleInfo nx_module_subsdk0;
 #endif
+#endif
 
 namespace nx {
 
-uint64_t mrs(CPU& c, uint32_t sysreg) {
+NX_GAME_API uint64_t mrs(CPU& c, uint32_t sysreg) {
     switch (sysreg) {
         case 0xDF02:  // CNTVCT_EL0
         case 0xDF01:  // CNTPCT_EL0
@@ -129,7 +140,9 @@ void cpu_profile_register(const char* name);  // cpu_profile.cpp
 
 static void nn_main(CPU& c) {
     init_module(c, nx_module_sdk);
-#ifdef NX_HAS_SUBSDK0
+#ifdef NX_GAME_DYNAMIC
+    if (const ModuleInfo* sub = plat::game_module("subsdk0")) init_module(c, *sub);
+#elif defined(NX_HAS_SUBSDK0)
     init_module(c, nx_module_subsdk0);
 #endif
     init_module(c, nx_module_main);
@@ -144,7 +157,12 @@ static void nn_main(CPU& c) {
 }
 
 // longjmp(buf, val): unwinds the host stack to the recompiled function that called setjmp on buf.
+#ifdef NX_GAME_DYNAMIC
+// Thrown inside lib<game>_game.so, where the setjmp frames catch it: the type must be that library's own.
+static void long_jmp(CPU& c) { plat::game_longjmp(c.x[0], uint32_t(c.x[1])); }
+#else
 static void long_jmp(CPU& c) { throw LongJmp{c.x[0], uint32_t(c.x[1])}; }
+#endif
 
 static void process_return(CPU&) {
     log("nn::init::Start returned");
@@ -166,12 +184,19 @@ void boot() {
     if (plat::setting("trace") == "1") g_trace = true;
     memory_init();
     kernel_init();
+#ifdef NX_GAME_DYNAMIC
+    std::vector<const ModuleInfo*> mods = {&nx_module_main};
+    if (const ModuleInfo* sub = plat::game_module("subsdk0")) mods.push_back(sub);
+    mods.push_back(&nx_module_sdk);
+    load_modules(mods.data(), mods.size(), plat::data_root() + "/analysis");
+#else
 #ifdef NX_HAS_SUBSDK0
     const ModuleInfo* mods[] = {&nx_module_main, &nx_module_subsdk0, &nx_module_sdk};
 #else
     const ModuleInfo* mods[] = {&nx_module_main, &nx_module_sdk};
 #endif
     load_modules(mods, sizeof(mods) / sizeof(mods[0]), plat::data_root() + "/analysis");
+#endif
 
     uint64_t tdata = 0, tdata_end = 0;
     if (tdata_range(nx_module_main, tdata, tdata_end) && tdata_end > tdata) {

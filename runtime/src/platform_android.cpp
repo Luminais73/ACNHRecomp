@@ -268,6 +268,97 @@ bool make_dirs(const std::string& path) {
 
 void log_line(const char* line) { __android_log_write(ANDROID_LOG_INFO, nx::game::kInfo.id, line); }
 
+// ---- the game's code: lib<game>_game.so from the game folder ---------------------------------------------------
+// The APK holds no game code. The player's computer builds the recompiled game as lib<game>_game.so
+// (tools/build_android.sh) and it goes into the game folder with the data. Shared storage cannot hold code that
+// runs (noexec), so it is copied into the app's own folder first, again whenever it changes.
+
+namespace {
+std::mutex g_game_mx;
+void* g_game_lib = nullptr;
+std::string g_game_from;  // the folder it was loaded from
+using LongJmpFn = void (*)(uint64_t, uint64_t);
+LongJmpFn g_game_longjmp = nullptr;
+
+std::string game_lib_name() { return std::string("lib") + nx::game::kInfo.id + "_game.so"; }
+
+// Copies src to dst unless dst already is a copy of it (size and modification time, kept in dst + ".from").
+bool copy_if_changed(const std::string& src, const std::string& dst, std::string& err) {
+    struct stat ss{};
+    if (stat(src.c_str(), &ss) != 0) return err = "missing " + src, false;
+    char stamp[64];
+    std::snprintf(stamp, sizeof stamp, "%lld %lld", (long long)ss.st_size, (long long)ss.st_mtime);
+    {
+        std::ifstream f(dst + ".from");
+        std::string have;
+        std::getline(f, have);
+        struct stat ds{};
+        if (have == stamp && stat(dst.c_str(), &ds) == 0 && ds.st_size == ss.st_size) return true;
+    }
+    make_dirs(dst.substr(0, dst.rfind('/')));
+    std::string tmp = dst + ".part";
+    int in = open(src.c_str(), O_RDONLY | O_CLOEXEC), out = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0700);
+    bool ok = in >= 0 && out >= 0;
+    std::vector<char> buf(8 << 20);
+    while (ok) {
+        ssize_t n = read(in, buf.data(), buf.size());
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            ok = n == 0;
+            break;
+        }
+        for (ssize_t done = 0; ok && done < n;) {
+            ssize_t w = write(out, buf.data() + done, size_t(n - done));
+            if (w < 0 && errno == EINTR) continue;
+            ok = w > 0, done += w;
+        }
+    }
+    if (in >= 0) close(in);
+    if (out >= 0 && close(out) != 0) ok = false;
+    if (!ok || rename(tmp.c_str(), dst.c_str()) != 0) {
+        unlink(tmp.c_str());
+        return err = "could not copy " + src + " (" + std::strerror(errno) + ")", false;
+    }
+    std::ofstream(dst + ".from") << stamp << "\n";
+    return true;
+}
+}  // namespace
+
+std::string load_game(const std::string& folder, const std::string& own_dir) {
+#ifndef NX_GAME_DYNAMIC
+    return "";  // linked in (NX_ANDROID_GAME_IN_APP)
+#endif
+    std::lock_guard lk(g_game_mx);
+    if (g_game_lib) return g_game_from == folder ? "" : "restart";  // one game library per process
+    std::string err, lib = own_dir + "/game/" + game_lib_name();
+    if (!copy_if_changed(folder + "/" + game_lib_name(), lib, err)) return err;
+    void* h = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) return std::string("dlopen: ") + dlerror();
+    auto abi = reinterpret_cast<const char* (*)()>(dlsym(h, "nx_game_abi"));
+    auto jmp = reinterpret_cast<LongJmpFn>(dlsym(h, "nx_game_longjmp"));
+    if (!abi || !jmp || !dlsym(h, "nx_module_main") || !dlsym(h, "nx_module_sdk")) {
+        dlclose(h);
+        return "not a game library: " + folder + "/" + game_lib_name();
+    }
+    if (std::strcmp(abi(), NX_GAME_ABI) != 0) {
+        std::string got = abi();
+        dlclose(h);
+        return "abi " + got + " (app " + NX_GAME_ABI + ")";
+    }
+    g_game_lib = h, g_game_from = folder, g_game_longjmp = jmp;
+    return "";
+}
+
+const nx::ModuleInfo* game_module(const char* name) {
+    std::string sym = std::string("nx_module_") + name;
+    return g_game_lib ? static_cast<const nx::ModuleInfo*>(dlsym(g_game_lib, sym.c_str())) : nullptr;
+}
+
+[[noreturn]] void game_longjmp(uint64_t buf, uint64_t val) {
+    g_game_longjmp(buf, val);
+    __builtin_unreachable();
+}
+
 std::string data_root() { return g_root; }
 
 std::string setting(const std::string& key) {
@@ -619,6 +710,36 @@ extern "C" JNIEXPORT jlong JNICALL Java_io_github_belmantegu_wonderrecomp_GameAc
     return jlong(nx::g_frame.load());
 }
 
+// The home screen (android/java/.../Home.java) checks the game folder the player picked with this before starting
+// the game: "" when lib<game>_game.so loads from it, else why not.
+extern "C" JNIEXPORT jstring JNICALL Java_io_github_acnhrecomp_Home_nativeLoadGame(JNIEnv* env, jclass, jstring folder,
+                                                                                  jstring files) {
+    auto str = [&](jstring js) {
+        std::string out;
+        if (const char* cs = js ? env->GetStringUTFChars(js, nullptr) : nullptr) out = cs, env->ReleaseStringUTFChars(js, cs);
+        return out;
+    };
+    return env->NewStringUTF(nx::plat::load_game(str(folder), str(files)).c_str());
+}
+
+// Back to the home screen with why the game cannot start (its game library did not load).
+static void open_home(android_app* app, const std::string& why) {
+    JNIEnv* env = nullptr;
+    app->activity->vm->AttachCurrentThread(&env, nullptr);
+    jclass intentc = env->FindClass("android/content/Intent");
+    jobject intent = env->NewObject(intentc, env->GetMethodID(intentc, "<init>", "()V"));
+    env->CallObjectMethod(intent, env->GetMethodID(intentc, "setClassName",
+                                                   "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;"),
+                          env->NewStringUTF(nx::game::kInfo.android_package),
+                          env->NewStringUTF("io.github.acnhrecomp.Home"));
+    env->CallObjectMethod(intent, env->GetMethodID(intentc, "putExtra",
+                                                   "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;"),
+                          env->NewStringUTF("error"), env->NewStringUTF(why.c_str()));
+    jclass actc = env->GetObjectClass(app->activity->clazz);
+    env->CallVoidMethod(app->activity->clazz, env->GetMethodID(actc, "startActivity", "(Landroid/content/Intent;)V"), intent);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
 extern "C" JNIEXPORT void ANativeActivity_onCreate(ANativeActivity* activity, void* saved, size_t size) {
     g_activity = activity;
     if (g_ui_pipe[0] < 0 && pipe2(g_ui_pipe, O_NONBLOCK | O_CLOEXEC) == 0)
@@ -779,6 +900,17 @@ extern "C" void android_main(android_app* app) {
 
     nx::log("%s (Switch recomp) on Android, data at %s (own folder %s: %s)", nx::game::kInfo.title, g_root.c_str(),
             own.c_str(), has_data(own) ? "has the data" : "no analysis/main.bin");
+    if (std::string why = load_game(g_root, g_cache_dir); !why.empty()) {
+        nx::log("game library: %s", why.c_str());
+        open_home(app, why);
+        ANativeActivity_finish(app->activity);
+        while (!app->destroyRequested) {  // the home screen lives in this process: no _exit
+            int events;
+            android_poll_source* src;
+            if (ALooper_pollOnce(100, nullptr, &events, reinterpret_cast<void**>(&src)) >= 0 && src) src->process(app, src);
+        }
+        return;
+    }
     static bool started = false;
     for (;;) {
         int events;

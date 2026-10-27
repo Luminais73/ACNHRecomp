@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Long press on the app icon: pick another game folder (Home.java). -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut android:shortcutId="pick" android:enabled="true" android:icon="@mipmap/ic_launcher"
+              android:shortcutShortLabel="@string/change_folder">
+        <intent android:action="android.intent.action.VIEW" android:targetPackage="io.github.acnhrecomp"
+                android:targetClass="io.github.acnhrecomp.Home">
+            <extra android:name="pick" android:value="true"/>
+        </intent>
+    </shortcut>
+</shortcuts>

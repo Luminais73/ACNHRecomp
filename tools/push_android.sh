@@ -38,7 +38,22 @@ if [ -d "$SRC/spirv" ]; then
   phone_s=$(adb shell "stat -c %s $D/spirv.pak 2>/dev/null || echo 0" | tr -d '\r')
   if [ "$local_s" != "$phone_s" ]; then adb push "$SRC/spirv.pak" "$D/" | tail -1; else echo "== spirv.pak: already there"; fi
 fi
-for f in config.ini language.txt users.txt; do [ -f "$SRC/$f" ] && adb push "$SRC/$f" "$D/" | tail -1; done
+# The game's recompiled code (tools/build_android.sh): the app loads it from this folder.
+LIB=private/$GAME/apk/lib${GAME}_game.so
+[ -f "$LIB" ] || { echo "no $LIB: tools/build_android.sh first"; exit 1; }
+local_s=$(stat -f %z "$LIB" 2>/dev/null || stat -c %s "$LIB")
+phone_s=$(adb shell "stat -c %s $D/lib${GAME}_game.so 2>/dev/null || echo 0" | tr -d '\r')
+if [ "$local_s" != "$phone_s" ] || [ "$LIB" -nt private/$GAME/apk/.pushed ]; then
+  adb push "$LIB" "$D/" | tail -1 && touch private/$GAME/apk/.pushed
+else
+  echo "== lib${GAME}_game.so: already there"
+fi
+# The computer's settings only for a first copy: the phone's own (its settings screen) are kept.
+for f in config.ini language.txt users.txt; do
+  [ -f "$SRC/$f" ] || continue
+  if [ "$(adb shell "[ -f $D/$f ] && echo y" | tr -d '\r')" = y ]; then echo "== $f: the phone's own kept"; continue; fi
+  adb push "$SRC/$f" "$D/" | tail -1
+done
 
 [ "$1" = --skip-romfs ] && exit 0
 total=$(python3 tools/pack_romfs.py "$SRC/extract/romfs" --size)

@@ -94,6 +94,14 @@ std::vector<Picked> g_picked;
 // Build page.
 std::vector<std::string> g_log;
 bool g_rebuild = false;  // started from home: no files page to go back to
+// Opened with nothing set up: the game folder is asked for at once; once it is chosen the setup runs by itself and
+// the game starts when it is done (the pages only show up when something is missing or fails).
+bool g_express = false;
+// Opened with a build: the game starts after a short countdown, which a click or a key stops (-2: from the first frame).
+double g_autostart_at = -1;
+void start_setup(bool rebuild);
+bool prereqs_block();
+void play();
 bool g_confirm_stop = false, g_confirm_quit = false;
 bool g_quit_after_stop = false;
 
@@ -160,6 +168,11 @@ void pick(Target t) {
         if (const char* d = SDL_GetUserFolder(SDL_FOLDER_DOWNLOADS)) last = d;
     const char* where = is_dir(last) ? last.c_str() : nullptr;
     void* user = reinterpret_cast<void*>(intptr_t(t));
+    if (const char* fake = std::getenv("NX_LAUNCHER_PICK"); fake && t == kPickGame) {  // tests: the dialog's answer
+        const char* list[] = {fake, nullptr};
+        on_picked(user, list, 0);
+        return;
+    }
     switch (t) {
         case kPickGame: SDL_ShowOpenFolderDialog(on_picked, user, g_window, where, false); break;
         case kPickMod: SDL_ShowOpenFileDialog(on_picked, user, g_window, zip, 2, where, false); break;
@@ -175,6 +188,32 @@ void use_file(Kind kind, const std::string& path) {
     set_item(kind == Kind::Game ? g_game : g_ptbr, kind, path);
     settings().set("files.last_dir", parent_dir(path));
     save_files();
+}
+
+// The express path (g_express): after the game folder, straight into the setup unless the folder or this computer
+// needs something first; a pt-BR translation zip in Downloads is taken along.
+void express_continue() {
+    if (g_game.check.status == Status::Error || g_game.check.status == Status::Empty) {
+        g_page = Page::Files;
+        return;
+    }
+    if (g_ptbr.path.empty()) {
+        std::vector<std::string> near;
+        if (const char* d = SDL_GetUserFolder(SDL_FOLDER_DOWNLOADS)) near.push_back(d);
+        near.push_back(parent_dir(g_game.path));
+        std::vector<Found> found = search_files(Kind::Mod, near);
+        // Only when there is one usable (they come first): with several, the player picks on the files page.
+        if (!found.empty() && found[0].check.status == Status::Ok &&
+            (found.size() == 1 || found[1].check.status != Status::Ok))
+            set_item(g_ptbr, Kind::Mod, found[0].path);
+    }
+    g_prereqs = check_prerequisites(g_install);
+    if (prereqs_block()) {
+        g_page = Page::Install;
+        return;
+    }
+    save_files();
+    start_setup(false);
 }
 
 // What a file or folder given to a card is: the card's kind (a wrong one then shows why).
@@ -224,6 +263,7 @@ void apply_picks() {
             case kPickBuild: use_build_folder(first); break;
             default:  // a card
                 use_file(slot_kind(p.target, first), first);
+                if (g_express && p.target == kPickGame) express_continue();
         }
         save_files();
     }
@@ -1005,6 +1045,7 @@ void page_build() {
         set_build(g_rebuild ? g_build.data : g_install, true);
         load_game_ini();
         g_page = Page::Done;
+        if (g_express) g_express = false, play();
         return;
     }
     const bool failed = s.finished && !s.cancelled, stopped = s.finished && s.cancelled;
@@ -1370,6 +1411,11 @@ void page_home() {
         hero(nx::ui::kIconHouse, kGreen, S(46));
         centered(tr("launcher.home.title"), g_title, 1.1f, kInk);
         ImGui::Dummy(ImVec2(0, S(6)));
+        if (g_autostart_at >= 0) {
+            int left = std::max(1, int(std::ceil(g_autostart_at - ImGui::GetTime())));
+            centered(trf("launcher.autostart", std::to_string(left)).c_str(), g_body, 0.9f, kInkSoft);
+            ImGui::Dummy(ImVec2(0, S(4)));
+        }
         contents_row();
         ImGui::Dummy(ImVec2(0, S(16)));
         play_block();
@@ -1531,6 +1577,12 @@ void pages_init(SDL_Window* window) {
         load_game_ini();
         g_page = Page::Home;
     }
+    if (!std::getenv("NX_LAUNCHER_PAGE") && !std::getenv("NX_LAUNCHER_SEARCH")) {
+        if (build.empty() && setup_supported())
+            g_express = true;
+        else if (!build.empty() && *g_build_problem == 0 && s.get("launcher.autostart", "1") != "0")
+            g_autostart_at = -2;
+    }
     // Tests: a card's search shown, a page directly (main.cpp).
     if (const char* q = std::getenv("NX_LAUNCHER_SEARCH")) {
         const char* names[] = {"game", "ptbr"};
@@ -1585,6 +1637,24 @@ bool pages_busy() { return setup_state().running || ImGui::GetTime() < g_toast_u
 
 bool pages_draw(float scale, ImFont* title) {
     g_scale = scale, g_title = title, g_body = ImGui::GetFont();
+    static bool first = true;
+    if (first) {
+        first = false;
+        if (g_express) pick(kPickGame);
+        if (g_autostart_at == -2) g_autostart_at = ImGui::GetTime() + 3;
+    }
+    if (g_autostart_at >= 0) {
+        bool stop = g_page != Page::Home || ImGui::IsMouseClicked(0) || ImGui::IsMouseClicked(1);
+        for (int k = ImGuiKey_NamedKey_BEGIN; !stop && k < ImGuiKey_NamedKey_END; k++)
+            if (ImGui::IsKeyPressed(ImGuiKey(k), false) && !(k >= ImGuiKey_ReservedForModCtrl && k <= ImGuiKey_ReservedForModSuper))
+                stop = true;
+        if (stop) {
+            g_autostart_at = -1;
+        } else if (ImGui::GetTime() >= g_autostart_at) {
+            g_autostart_at = -1;
+            play();
+        }
+    }
     apply_picks();
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 ds = io.DisplaySize;

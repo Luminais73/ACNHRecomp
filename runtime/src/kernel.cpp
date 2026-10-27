@@ -787,7 +787,7 @@ void svc_frame_take(uint64_t& total, uint64_t& top_ns, uint32_t& top_imm, uint64
     top_imm = g_frame_svc_top_imm.load(), top_pc = g_frame_svc_top_pc.load();
 }
 
-void svc(CPU& c, uint32_t imm, uint64_t pc) {
+NX_GAME_API void svc(CPU& c, uint32_t imm, uint64_t pc) {
     if (!t_svc_role || !(svc_profile_on() || frame_profile_on())) return svc_impl(c, imm, pc);
     uint64_t t0 = plat::monotonic_ns();
     svc_impl(c, imm, pc);

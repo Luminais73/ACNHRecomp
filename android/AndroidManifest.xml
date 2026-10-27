@@ -1,16 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- NativeActivity app: everything is in lib<game>.so (platform_android.cpp); no Java code. -->
+<!-- Home (android/java) asks for the game folder, then NativeActivity runs lib<game>.so (platform_android.cpp), which
+     loads the game's code from that folder: the APK holds nothing of the game. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
           package="io.github.acnhrecomp"
-          android:versionCode="3" android:versionName="0.3">
+          android:versionCode="4" android:versionName="0.4">
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35"/>
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true"/>
     <uses-feature android:glEsVersion="0x00030000" android:required="true"/>
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
     <uses-permission android:name="android.permission.VIBRATE"/>
-    <application android:label="ACNH Recomp" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:hasCode="false" android:extractNativeLibs="true"
+    <application android:label="ACNH Recomp" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:hasCode="true" android:extractNativeLibs="true"
                  android:isGame="true" android:appCategory="game" android:largeHeap="true"
                  android:requestLegacyExternalStorage="true">
+        <activity android:name="io.github.acnhrecomp.Home" android:exported="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|smallestScreenSize|uiMode|density|navigation">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts"/>
+        </activity>
         <activity android:name="android.app.NativeActivity" android:exported="true"
                   android:screenOrientation="sensorLandscape" android:resizeableActivity="false"
                   android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|smallestScreenSize|uiMode|density|navigation"
@@ -18,10 +28,6 @@
             <meta-data android:name="android.app.lib_name" android:value="acnh"/>
             <!-- Draw under the camera cutout: the game fills the whole screen. -->
             <meta-data android:name="android.max_aspect" android:value="3.0"/>
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN"/>
-                <category android:name="android.intent.category.LAUNCHER"/>
-            </intent-filter>
         </activity>
     </application>
 </manifest>

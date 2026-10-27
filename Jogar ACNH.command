@@ -7,10 +7,23 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO" || { echo "ACNH Recomp folder not found ($REPO)"; read -r -p "Press Enter to close"; exit 1; }
 BUILD=private/acnh/build
 
+# Not set up yet: the launcher (built here the first time, a minute) asks for the game folder, recompiles the game
+# from it and starts it.
 if [ ! -x "$BUILD/acnh" ]; then
-  echo "The game is not built yet: run the setup first (README, Installation)."
-  read -r -p "Press Enter to close"
-  exit 1
+  LB=private/launcher-build
+  if [ ! -x "$LB/acnhrecomp_launcher" ]; then
+    if ! command -v cmake >/dev/null || ! command -v ninja >/dev/null || ! brew --prefix sdl3 >/dev/null 2>&1; then
+      echo "To open the launcher this needs: brew install cmake ninja sdl3"
+      read -r -p "Press Enter to close"
+      exit 1
+    fi
+    echo "Preparing the launcher (once)..."
+    mkdir -p private
+    { cmake -S . -B "$LB" -G Ninja -DNX_GAME=acnh -DNX_GEN_DIR="$PWD/$LB/no-gen" -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH="$(brew --prefix)" && cmake --build "$LB" --target acnhrecomp_launcher; } > "$LB.log" 2>&1 ||
+      { tail -20 "$LB.log"; read -r -p "The launcher did not build (full output: $LB.log). Press Enter to close"; exit 1; }
+  fi
+  exec "$LB/acnhrecomp_launcher"
 fi
 
 if command -v ninja >/dev/null && [ -f "$BUILD/build.ninja" ]; then

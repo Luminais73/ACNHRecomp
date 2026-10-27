@@ -174,7 +174,7 @@ HookRegistrar::HookRegistrar(uint64_t offset, HleFn fn) { hooks()[offset] = fn; 
 }  // namespace nx
 
 // Called by the generated code (declared there: recomp/emit.py).
-void nx_hook(nx::CPU& c, uint64_t pc) {
+NX_GAME_API void nx_hook(nx::CPU& c, uint64_t pc) {
     auto it = nx::hooks().find(pc - nx::kModuleBase);
     if (it != nx::hooks().end()) [[likely]]
         it->second(c);
@@ -276,8 +276,15 @@ constexpr unsigned kCallCacheBits = 13;  // 8192 entries, 64 KB
 std::atomic<uint64_t> g_call_cache[1u << kCallCacheBits];
 uint64_t g_cache_base = 0, g_cache_span = 0;  // modules within [base, base + span); span 0: the cache is off
 
+#ifdef NX_GAME_DYNAMIC
+// The game's code is another library (Android), anywhere in the address space: the offsets are from its first
+// function instead, set by load_modules.
+uintptr_t g_anchor = 0;
+inline uintptr_t anchor() { return g_anchor; }
+#else
 void call_anchor(CPU&) {}
 inline uintptr_t anchor() { return reinterpret_cast<uintptr_t>(&call_anchor); }
+#endif
 
 inline uint32_t cache_slot(uint64_t rel) {
     return uint32_t((uint32_t(rel >> 2) * 0x9E3779B1u) >> (32 - kCallCacheBits));
@@ -323,7 +330,7 @@ inline uint32_t cache_slot(uint64_t rel) {
     fatal("call to %llx (%s), lr %s", (unsigned long long)t, describe(t).c_str(), describe(c.x[30]).c_str());
 }
 
-void call(CPU& c, uint64_t t) {
+NX_GAME_API void call(CPU& c, uint64_t t) {
     uint64_t rel = t - g_cache_base;
     if (rel < g_cache_span) [[likely]] {
         uint64_t e = g_call_cache[cache_slot(rel)].load(std::memory_order_relaxed);
@@ -339,7 +346,7 @@ void trace_sp(CPU& c, uint64_t pc) {
     log("sp %llx x19 %llx at %s", (unsigned long long)c.x[31], (unsigned long long)c.x[19], describe(pc).c_str());
 }
 
-[[noreturn]] void unimpl(CPU& c, uint64_t pc, const char* what) {
+[[noreturn]] NX_GAME_API void unimpl(CPU& c, uint64_t pc, const char* what) {
     for (int k = 0; k < 31; k += 4)
         log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k], (unsigned long long)c.x[k + 1],
             (unsigned long long)c.x[k + 2], (unsigned long long)(k + 3 < 32 ? c.x[k + 3] : 0));
@@ -385,13 +392,13 @@ std::unordered_map<std::string, Variant>& variants() {
 }  // namespace nx
 
 // Read by the dispatchers of the --variant functions; set by load_modules (after config.ini), before any guest code.
-extern "C" bool nx_variant_on = false;
+extern "C" NX_GAME_API bool nx_variant_on = false;
 // NX_VARIANT_RANGE=<lo>-<hi> (hex module offsets): only the functions starting there take their patched bodies.
-extern "C" uint64_t nx_variant_lo = 0, nx_variant_hi = ~0ull;
+extern "C" NX_GAME_API uint64_t nx_variant_lo = 0, nx_variant_hi = ~0ull;
 
 namespace nx {
 
-VariantRegistrar::VariantRegistrar(const char* module, const uint32_t* words, size_t count) {
+NX_GAME_API VariantRegistrar::VariantRegistrar(const char* module, const uint32_t* words, size_t count) {
     variants()[module] = {words, count};
 }
 
@@ -427,6 +434,9 @@ void load_modules(const ModuleInfo* const* mods, size_t count, const std::string
         vm_set(mi->base + mi->data, size - mi->data, kMemCodeData, 3);
 
         g_modules.push_back(LoadedModule{mi, mi->base, size});
+#ifdef NX_GAME_DYNAMIC
+        if (!g_anchor && mi->func_count) g_anchor = reinterpret_cast<uintptr_t>(mi->funcs[0].fn);
+#endif
         if (g_fast_count < 4) g_fast[g_fast_count++] = fast_module(mi);
         {  // the call cache covers every module while they all fit 2^34 bytes (keys are 32-bit words)
             static const bool cache = [] {

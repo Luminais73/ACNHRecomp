@@ -104,14 +104,19 @@ if(NX_LAUNCHER AND NOT ANDROID)
 endif()
 
 # Without the generated code (a checkout with no game data) only the tests and the launcher above are built.
+# Android builds the runtime without it too: the app (lib<game>.so) holds no game code and loads lib<game>_game.so,
+# made from the player's own copy on their computer, from the game folder picked on the phone (docs/ANDROID.md).
 file(GLOB NX_GEN_PROBE "${NX_GEN_DIR}/main/*.cpp")
-if(NOT NX_GEN_PROBE)
+if(NOT NX_GEN_PROBE AND NOT ANDROID)
     message(WARNING "No generated code in ${NX_GEN_DIR}/main: building the unit tests only")
     return()
 endif()
 
 # Extra modules some games recompile too (ACNH: subsdk0 = nn::movie). Present when their generated code is.
-set(NX_MODULES main sdk)
+set(NX_MODULES)
+if(NX_GEN_PROBE)
+    set(NX_MODULES main sdk)
+endif()
 if(EXISTS "${NX_GEN_DIR}/subsdk0/table.cpp")
     list(APPEND NX_MODULES subsdk0)
 endif()
@@ -126,6 +131,9 @@ foreach(mod ${NX_MODULES})
         # armv8.2-a+crypto: cpu.h's AES/SHA paths need __ARM_FEATURE_AES/SHA2 (the NDK default armv8-a has neither).
         target_compile_options(game_${mod} PRIVATE -O2 -fPIC -fvisibility=hidden -fno-semantic-interposition
                                -march=armv8.2-a+crypto)
+        # The module's table (nx_module_<name>) is what the app looks up in lib<game>_game.so.
+        set_source_files_properties("${NX_GEN_DIR}/${mod}/table.cpp" TARGET_DIRECTORY game_${mod}
+                                    PROPERTIES COMPILE_OPTIONS -fvisibility=default)
     elseif(APPLE)
         target_compile_options(game_${mod} PRIVATE -O2 -fvisibility=hidden)
     elseif(UNIX)
@@ -246,6 +254,15 @@ else()
 endif()
 
 if(ANDROID)
+    # What the app and lib<game>_game.so must agree on (the CPU context, the module tables, the runtime's calls): a
+    # game library built from other headers is refused at start, asking for it to be built again.
+    set(NX_ABI_TEXT "")
+    foreach(h cpu.h module.h runtime.h)
+        file(READ "${CMAKE_SOURCE_DIR}/runtime/include/nx/${h}" t)
+        string(APPEND NX_ABI_TEXT "${t}")
+    endforeach()
+    string(SHA1 NX_GAME_ABI "${NX_ABI_TEXT}")
+    string(SUBSTRING "${NX_GAME_ABI}" 0 12 NX_GAME_ABI)
     # NativeActivity app: lib<game>.so, entry android_main (android_native_app_glue).
     set(GLUE "${ANDROID_NDK}/sources/android/native_app_glue")
     add_library(${NX_GAME} SHARED ${NX_RUNTIME_SOURCES} runtime/src/platform_android.cpp
@@ -255,7 +272,15 @@ if(ANDROID)
     # Our ANativeActivity_onCreate (platform_android.cpp) runs first, on the UI thread, then calls the glue's.
     set_source_files_properties("${GLUE}/android_native_app_glue.c" PROPERTIES
         COMPILE_DEFINITIONS "ANativeActivity_onCreate=glue_ANativeActivity_onCreate")
-    target_link_libraries(${NX_GAME} PRIVATE ${NX_GAME_LIBS} android log aaudio)
+    target_link_libraries(${NX_GAME} PRIVATE android log aaudio)
+    # NX_ANDROID_GAME_IN_APP=ON: the game's code linked into lib<game>.so as before (comparisons; never published).
+    option(NX_ANDROID_GAME_IN_APP "Link the game's code into the app's library" OFF)
+    if(NX_ANDROID_GAME_IN_APP)
+        target_link_libraries(${NX_GAME} PRIVATE ${NX_GAME_LIBS})
+        target_compile_definitions(${NX_GAME} PRIVATE NX_GAME_ABI="${NX_GAME_ABI}")
+    else()
+        target_compile_definitions(${NX_GAME} PRIVATE NX_GAME_DYNAMIC NX_GAME_ABI="${NX_GAME_ABI}")
+    endif()
     # libadrenotools (BSD-2-Clause): loads Turnip (tools/build_turnip.sh) instead of the phone's Adreno driver. Its
     # hook libraries (libhook_impl.so, libmain_hook.so, ...) go into the APK next to lib<game>.so.
     include(FetchContent)
@@ -267,6 +292,16 @@ if(ANDROID)
     target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden -fno-semantic-interposition -march=armv8.2-a+crypto)
     # The glue's ANativeActivity_onCreate must be exported. 16 KB page alignment: Android 15+ devices with 16 KB pages.
     target_link_options(${NX_GAME} PRIVATE -u ANativeActivity_onCreate -Wl,-z,max-page-size=16384)
+    # The game's code: lib<game>_game.so, linked against the app's library for the few functions it calls (nx::call,
+    # svc, mrs, ...: NX_GAME_API). Never in the APK; tools/build_android.sh leaves it beside, for the game folder.
+    if(NX_GAME_LIBS AND NOT NX_ANDROID_GAME_IN_APP)
+        add_library(${NX_GAME}_game SHARED runtime/src/game_abi.cpp)
+        target_include_directories(${NX_GAME}_game PRIVATE runtime/include)
+        target_compile_options(${NX_GAME}_game PRIVATE -fvisibility=hidden -march=armv8.2-a+crypto)
+        target_compile_definitions(${NX_GAME}_game PRIVATE NX_GAME_ABI="${NX_GAME_ABI}")
+        target_link_libraries(${NX_GAME}_game PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${NX_GAME_LIBS}>" ${NX_GAME})
+        target_link_options(${NX_GAME}_game PRIVATE -Wl,-z,max-page-size=16384)
+    endif()
 elseif(APPLE)
     # macOS: SDL3 (window, input, audio) and the Vulkan loader + MoltenVK from Homebrew
     # (brew install sdl3 vulkan-headers vulkan-loader molten-vk).
@@ -349,7 +384,7 @@ execute_process(COMMAND git describe --always --dirty WORKING_DIRECTORY ${CMAKE_
 if(NOT NX_GIT_DESCRIBE)
     set(NX_GIT_DESCRIBE "dev")
 endif()
-target_compile_definitions(${NX_GAME} PRIVATE NX_VERSION_STRING="0.3-${NX_GIT_DESCRIBE}")
+target_compile_definitions(${NX_GAME} PRIVATE NX_VERSION_STRING="0.4-${NX_GIT_DESCRIBE}")
 
 if("subsdk0" IN_LIST NX_MODULES)
     target_compile_definitions(${NX_GAME} PRIVATE NX_HAS_SUBSDK0)

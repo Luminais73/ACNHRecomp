@@ -121,7 +121,7 @@ GPU; see [docs/STATUS.md](docs/STATUS.md) for the full, regularly updated log.
 | Linux x86-64 | Tested (Ubuntu, clang 21, Intel Iris Xe / Mesa ANV) |
 | macOS (Apple Silicon, MoltenVK) | Tested (M1, macOS 26/27, Homebrew's MoltenVK) |
 | Windows x86-64 | Builds with `tools/setup_acnh.py` (clang-cl, SDL3); contributed by a fork, not tested here |
-| Android (Snapdragon, Turnip) | Tested (Galaxy S20 FE / Snapdragon 865: 30 fps, 60 shown with frame generation); built on a computer from your own game, see [docs/ANDROID.md](docs/ANDROID.md) |
+| Android (Snapdragon, Turnip) | Tested (Galaxy S20 FE / Snapdragon 865: 26-30 fps, shown doubled with frame generation). The app holds no game and is in the releases; it asks for the game folder your computer prepares from your own game, see [docs/ANDROID.md](docs/ANDROID.md) |
 
 ## Disclaimer
 
@@ -199,6 +199,14 @@ from small laptop screens to 4K.
 git clone <this repository> ACNHRecomp && cd ACNHRecomp
 tools/launcher.sh            # builds the launcher the first time (cmake, a C++ compiler and SDL3), then opens it
 ```
+
+On macOS, double-clicking `Jogar ACNH.command` does the same (and, once the game is set up, starts it).
+
+**The short way.** The first time, the launcher opens straight on the system's folder dialog: pick your game
+folder, and if this computer has what it needs the setup runs by itself and the game starts when it is done (a
+pt-BR `.zip` in Downloads is taken along). The pages below only show up when something is missing or fails, or when
+the dialog is closed. Later the launcher starts the game after a 3-second countdown; a click or a key keeps it
+open on its home page (`launcher.autostart = 0` in `launcher.ini`: no countdown).
 
 By hand: `cmake -S . -B build/launcher -DNX_GAME=acnh && cmake --build build/launcher --target acnhrecomp_launcher`,
 then run `build/launcher/acnhrecomp_launcher`.

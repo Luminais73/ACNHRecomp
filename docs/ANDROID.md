@@ -5,8 +5,12 @@ for Adreno, carried inside the app). It was brought up and tuned on a Galaxy S20
 on the island the game holds its own 30 frames a second and the phone shows 60 with the built-in frame generation,
 at 900 rendered rows scaled to the 2400x1080 screen (the full 20:9 screen, under the camera cutout).
 
-The app is built on your computer from **your own copy of the game**, like the desktop versions: nothing of the game
-is in this repository or in its releases, and the APK you build must not be shared.
+The app holds **nothing of the game**: it is the runtime only (a few MB), the same for everyone, and the releases
+of this repository carry it ready to install. The game itself comes from **your own copy**: your computer
+recompiles it (as for the desktop versions) and prepares a *game folder* for the phone: the recompiled code as
+`libacnh_game.so`, the RomFS as `romfs.pak`, the shaders as `spirv.pak`, fonts and the translation. When the app
+opens it asks for that folder, checks it and starts the game; next time it starts right away. That folder (and the
+`libacnh_game.so` in it) must not be shared.
 
 ## What you need
 
@@ -24,7 +28,7 @@ is in this repository or in its releases, and the APK you build must not be shar
   Developer options > USB debugging), connected by USB, `adb devices` listing it. About 11 GB free on the memory card
   or the phone's storage.
 
-## Build, install, copy the data
+## Prepare the game folder, install the app
 
 All in one (checks what is missing and says how to get it):
 
@@ -32,16 +36,34 @@ All in one (checks what is missing and says how to get it):
 tools/android_install.sh --save      # --save: also your computer's save (the phone's own is kept beside it)
 ```
 
+It builds the app and `libacnh_game.so` (the first build compiles the whole game: 30-60 min), installs the app and
+copies the game folder to the phone: the app's folder on the memory card when there is one
+(`Android/data/io.github.acnhrecomp/files`), else the phone's own storage. The copy can be interrupted and run
+again: it resumes, and later runs re-send only what changed (the phone's own settings are kept).
+
 Or step by step:
 
 ```sh
-tools/build_android.sh --install     # the APK (the first build compiles the whole game: 30-60 min), installed by adb
-tools/push_android.sh                # the game's data to the phone (~10 GB: romfs.pak, spirv.pak, fonts, mods, ...)
+tools/build_android.sh --install     # the app (APK) and private/acnh/apk/libacnh_game.so
+tools/push_android.sh                # the game folder to the phone (~10 GB)
 ```
 
-`push_android.sh` puts everything in the app's folder on the memory card when there is one
-(`Android/data/io.github.acnhrecomp/files`), else in the phone's own storage. It can be interrupted and run again:
-it resumes. Run it again after updating the repository and rebuilding (it re-sends only what changed).
+`tools/build_android.sh --no-game` builds only the app, without any game set up on the computer (what a release
+carries).
+
+### Opening the app
+
+The first time, **ACNH Recomp** shows its home screen:
+
+- *Use the game found*: the folder `android_install.sh` copied into the app's own folder.
+- *Choose the game folder*: any other folder with the prepared game (e.g. one copied by USB to `ACNH` on the memory
+  card). The app then asks for access to all files once: Android needs it to read a folder outside the app's own.
+
+The game starts as soon as the folder checks out (the first time a few seconds more: `libacnh_game.so` is copied
+into the app). To pick another folder later: long press on the app icon > *Change game folder*.
+
+If the app was updated and the folder was prepared by an older version, the home screen says so: run
+`tools/android_install.sh` again (it rebuilds `libacnh_game.so` for the new app).
 
 The pt-BR translation: install it on the computer as for the desktop version (the setup installs a
 `*ptbr*.zip` found in the game folder or `private/translations/`); `push_android.sh` sends `mods/` with it.
@@ -95,14 +117,18 @@ itself; a cooler helps.
 | Shown | ~40-48 | ~60 |
 | Hitches over 10 minutes standing | many | 0 |
 
+These are at night in the game (it follows the phone's clock). In daylight, with the sun's shadows, the same spot
+runs at 26-28 game frames a second: the replay (the NVN commands translated to Vulkan, on one core) takes 31-34 ms a
+frame there, and it gets slower the busier the GPU is, as both share the memory (28.5 ms with frame generation off;
+the floors of the memory bus and L3 clocks raised made no difference). The phone reaches 78-83 °C within minutes.
 Native 1080 rows run at ~26 game frames a second on the Adreno 650 (the GPU is the limit there).
+Benchmarks: `NX_TIME_OFFSET=<seconds>` in `config.txt` moves the game's clock, for the same light every run.
 
 ## Troubleshooting
 
 - **Black screen or the app closes at start**: `adb shell cat <data folder>/nx.log | tail -50` and open an issue
   with it. `adb logcat -s acnh` shows the same log live.
-- **The app asks for access to all files**: it found no data in its own folders (no `analysis/main.bin`): run
-  `tools/push_android.sh` again, or allow the access if you put the data in `Internal storage/Animal Crossing: New
-  Horizons` yourself.
+- **The home screen says the folder has no prepared game**: it lacks `libacnh_game.so` or `analysis/main.bin`: run
+  `tools/push_android.sh` again, or pick the folder that has them.
 - **Settings for testing** go in `config.txt` in the data folder, one `NX_...=value` per line (they win over the
   settings screen). E.g. `NX_RENDER_HEIGHT=1080` for native 1080 rows.
