@@ -880,7 +880,7 @@ extern "C" void android_main(android_app* app) {
             auto eq = line.find('=');
             // NX_* for the runtime; TU_* / MESA_* / FD_* for Turnip (read when the driver loads, later).
             bool ours = line.rfind("NX_", 0) == 0 || line.rfind("TU_", 0) == 0 || line.rfind("MESA_", 0) == 0 ||
-                        line.rfind("FD_", 0) == 0;
+                        line.rfind("FD_", 0) == 0 || line.rfind("IR3_", 0) == 0;  // IR3_*: Turnip's shader compiler
             if (ours && eq != std::string::npos)
                 setenv(line.substr(0, eq).c_str(), line.substr(eq + 1).c_str(), 0);
         }

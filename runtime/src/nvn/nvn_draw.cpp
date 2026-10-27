@@ -82,6 +82,7 @@ struct Bound {
     uint32_t raster[10] = {};  // raster_dynamic's inputs: stencil reference and masks per face, the depth bias
 };
 PerThread<Bound> g_bound;
+PerThread<uint64_t> g_bound_gen;  // bumped with every reset of g_bound (bind_sets' repeat check, nvn_sets.cpp)
 PerThread<uint64_t> g_state_set, g_state_kept;  // state commands recorded and left out, for the log
 
 template <typename T>
@@ -619,7 +620,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     }
     draw_part(3);
 
-    if ((*g_bound).cb != cb || draw_slow(kSlowState)) (*g_bound) = Bound{}, (*g_bound).cb = cb;
+    if ((*g_bound).cb != cb || draw_slow(kSlowState)) (*g_bound) = Bound{}, (*g_bound_gen)++, (*g_bound).cb = cb;
     if ((*g_bound).pipeline != pipeline) {
         p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         (*g_bound).pipeline = pipeline, (*g_state_set)++;
@@ -761,7 +762,7 @@ void draw_timing_submit();
 void draw_begin_worker(bool fresh) {
     (*g_rendering) = false;
     (*g_vertex_pending) = false, (*g_vertex_visible_at) = (*g_pass_serial);
-    (*g_bound) = Bound{};
+    (*g_bound) = Bound{}, (*g_bound_gen)++;
     (*g_pass_written) = 0;
     (*g_uw) = UwTarget{};
     clears_begin_submit();
@@ -772,7 +773,7 @@ void draw_begin_submit() {
     draw_timing_submit();
     (*g_rendering) = false;
     (*g_vertex_pending) = false, (*g_vertex_visible_at) = (*g_pass_serial);  // each command buffer begins with a full barrier
-    (*g_bound) = Bound{};  // a new command buffer
+    (*g_bound) = Bound{}, (*g_bound_gen)++;  // a new command buffer
     submit_lists_reset();
     sets_begin_submit();
     clears_begin_submit();
@@ -857,7 +858,8 @@ VkExtent2D pass_extent() { return (*g_pass_extent); }
 void pass_begin(VkCommandBuffer cb, const Targets& t) { begin_rendering(cb, t); }
 // After a clear inside the pass (nvn_clears.cpp). A masked one is a fullscreen draw with its own pipeline, viewport
 // and scissor (nvn_mask_clear.cpp): the next draw sets everything again.
-void pass_mark_written(uint32_t bits) { (*g_pass_written) |= bits, (*g_bound) = Bound{}; }
+uint64_t bound_generation() { return *g_bound_gen; }
+void pass_mark_written(uint32_t bits) { (*g_pass_written) |= bits, (*g_bound) = Bound{}, (*g_bound_gen)++; }
 
 bool replay::pass_wrote(const GpuImage* img) {
     if (!(*g_rendering) || !img) return false;

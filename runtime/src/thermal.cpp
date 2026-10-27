@@ -409,8 +409,11 @@ struct Governor {
             return;
         }
         // Hot: the ceilings a step lower every 10 s (to the mode's limit); cooled down: a step back every 20 s.
-        bool hot = headroom >= m.headroom_hot || temp >= m.temp_hot;
-        bool cooled = headroom < m.headroom_hot - 0.1f && temp < m.temp_hot - 4;
+        // The CPU sensors when they read; AThermal's headroom only without them: the S20 FE's ROM reports over 1.0 even
+        // cold, which kept the ceilings down for good (the big cores never back at the system's 1.75 GHz).
+        const bool have_temp = temp > 0;
+        bool hot = have_temp ? temp >= m.temp_hot : headroom >= m.headroom_hot;
+        bool cooled = have_temp ? temp < m.temp_hot - 4 : headroom < m.headroom_hot - 0.1f;
         hot_n = hot ? hot_n + 1 : 0, cool_n = cooled ? cool_n + 1 : 0;
         if (hot_n >= 5 && drop < m.max_drop) {
             drop++, hot_n = 0;

@@ -12,6 +12,9 @@
 #include "nvn_draw_state.h"
 #include "nvn_ultrawide.h"
 
+namespace nx::nvn {
+uint64_t bound_generation();  // nvn_draw.cpp
+}
 namespace nx::nvn::replay {
 
 using namespace nx::vk;
@@ -161,6 +164,7 @@ PerThread<TlsArray<HandleSlot, kHandleSlots>> g_handle_slots;
 PerThread<uint64_t> g_handle_generation{1}, g_handle_mark;
 PerThread<uint32_t> g_handle_used;
 PerThread<uint64_t> g_handle_hits, g_handle_misses, g_sets_skipped;
+PerThread<uint64_t> g_binds_made, g_binds_kept;  // bind_sets: binds recorded, and the repeats left out
 
 void handles_reset() { (*g_handle_generation)++, (*g_handle_used) = 0; }
 
@@ -689,6 +693,31 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
         p_vkCmdBindDescriptorSets(cb, point, layout.layout, 0, 4, d.sets, noff, offsets);
         return;
     }
+    // The same sets and offsets as this command buffer's last bind: not bound again. Turnip re-fetches every
+    // descriptor of the pipeline on each vkCmdBindDescriptorSets, unchanged or not (tu_bind_descriptor_sets ->
+    // DESC_SETS_LOAD, with the descriptor caches invalidated). NX_BIND_SKIP=0: always bound.
+    struct LastBind {
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkPipelineBindPoint point{};
+        VkDescriptorSet sets[4] = {};
+        uint32_t noff = 0, offsets[64] = {};
+        uint64_t gen = 0;  // bound_generation(): something else bound in between (a masked clear)
+    };
+    static PerThread<LastBind> last_pt;
+    LastBind& last = *last_pt;
+    static const bool skip = !(std::getenv("NX_BIND_SKIP") && std::getenv("NX_BIND_SKIP")[0] == '0');
+    const uint64_t gen = bound_generation();
+    if (skip && last.gen == gen && last.cb == cb && last.layout == layout.layout && last.point == point && last.noff == noff &&
+        std::memcmp(last.sets, d.sets, sizeof last.sets) == 0 &&
+        std::memcmp(last.offsets, offsets, noff * sizeof(uint32_t)) == 0) {
+        (*g_binds_kept)++;
+        return;
+    }
+    last.cb = cb, last.layout = layout.layout, last.point = point, last.noff = noff, last.gen = gen;
+    std::memcpy(last.sets, d.sets, sizeof last.sets);
+    std::memcpy(last.offsets, offsets, noff * sizeof(uint32_t));
+    (*g_binds_made)++;
     for (uint32_t k = 0; k < 4;) {
         if (!d.sets[k]) {
             k++, (*g_sets_skipped)++;
@@ -809,6 +838,10 @@ void sets_begin_submit() {
 }
 
 void sets_log() {
+    if (*g_binds_made + *g_binds_kept)
+        log("nvn: descriptor binds: %llu recorded, %llu repeats left out", (unsigned long long)*g_binds_made,
+            (unsigned long long)*g_binds_kept);
+    *g_binds_made = *g_binds_kept = 0;
     if ((*g_memo_hits) + (*g_memo_misses))
         log("nvn: upload memo: %llu hits, %llu misses", (unsigned long long)(*g_memo_hits), (unsigned long long)(*g_memo_misses));
     (*g_memo_hits) = (*g_memo_misses) = 0;
