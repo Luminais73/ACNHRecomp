@@ -288,6 +288,10 @@ void collect_slot() {
 bool framegen_wanted() {
     static const bool on = [] {
         const char* e = std::getenv("NX_FRAMEGEN");
+#if defined(__ANDROID__)
+        // On by default on Android: phones keep the game's 30 fps at best, and show 60 with it.
+        if (!e) e = "1";
+#endif
         if (!e || e[0] != '1') return false;
         // 60 presents a second already (video.frame_rate = 60): nothing to fill in.
         const char* i = std::getenv("NX_PRESENT_INTERVAL");

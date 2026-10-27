@@ -7,16 +7,19 @@
 #   the Vulkan headers: private/third_party/Vulkan-Headers-1.4.357 (tools/setup_acnh.sh; the NDK's are older than
 #   what the runtime calls)
 #   needs: Android SDK with ndk;28.2.13676358, build-tools;35.0.0, platforms;android-35 (ANDROID_SDK_ROOT, default
-#   ~/Library/Android/sdk) and a JDK (JAVA_HOME, default Homebrew's openjdk@17)
+#   ~/Library/Android/sdk on macOS, ~/Android/Sdk on Linux) and a JDK 17 (JAVA_HOME; Homebrew's openjdk@17 found by
+#   itself)
 cd "$(dirname "$0")/.." || exit 1
 set -e
 GAME=acnh
-SDK=${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}
+# macOS: Android Studio's SDK folder; Linux: ~/Android/Sdk.
+if [ "$(uname)" = Darwin ]; then HOST=darwin-x86_64; DEF_SDK=$HOME/Library/Android/sdk; else HOST=linux-x86_64; DEF_SDK=$HOME/Android/Sdk; fi
+SDK=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$DEF_SDK}}
 NDK=$SDK/ndk/28.2.13676358
 BT=$SDK/build-tools/35.0.0
 PLATFORM=$SDK/platforms/android-35/android.jar
-export JAVA_HOME=${JAVA_HOME:-/opt/homebrew/opt/openjdk@17}
-export PATH=$JAVA_HOME/bin:$PATH
+if [ -z "${JAVA_HOME:-}" ] && [ -d /opt/homebrew/opt/openjdk@17 ]; then export JAVA_HOME=/opt/homebrew/opt/openjdk@17; fi
+[ -n "${JAVA_HOME:-}" ] && export PATH=$JAVA_HOME/bin:$PATH
 BUILD=private/$GAME/build-android
 OUT=private/$GAME/apk
 INSTALL=0
@@ -46,7 +49,7 @@ rmdir private/build.lock; trap - EXIT
 
 echo "== package"
 rm -rf "$OUT"; mkdir -p "$OUT/lib/arm64-v8a"
-"$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip" --strip-unneeded -o "$OUT/lib/arm64-v8a/lib$GAME.so" \
+"$NDK/toolchains/llvm/prebuilt/$HOST/bin/llvm-strip" --strip-unneeded -o "$OUT/lib/arm64-v8a/lib$GAME.so" \
   "$BUILD/lib$GAME.so"
 # libadrenotools' hook libraries, and Turnip when it was built (tools/build_turnip.sh): the Adreno driver it loads.
 cp $(find "$BUILD/_deps" -name "lib*hook*.so") "$OUT/lib/arm64-v8a/"

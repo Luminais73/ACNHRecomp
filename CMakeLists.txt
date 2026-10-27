@@ -349,7 +349,7 @@ execute_process(COMMAND git describe --always --dirty WORKING_DIRECTORY ${CMAKE_
 if(NOT NX_GIT_DESCRIBE)
     set(NX_GIT_DESCRIBE "dev")
 endif()
-target_compile_definitions(${NX_GAME} PRIVATE NX_VERSION_STRING="0.2-${NX_GIT_DESCRIBE}")
+target_compile_definitions(${NX_GAME} PRIVATE NX_VERSION_STRING="0.3-${NX_GIT_DESCRIBE}")
 
 if("subsdk0" IN_LIST NX_MODULES)
     target_compile_definitions(${NX_GAME} PRIVATE NX_HAS_SUBSDK0)

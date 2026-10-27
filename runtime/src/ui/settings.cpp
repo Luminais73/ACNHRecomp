@@ -418,11 +418,16 @@ void page_video() {
     });
     // Built-in (nvn_framegen.cpp) always; lsfg-vk when it is installed (or already chosen).
     bool lsfg = lsfg_available();
-    std::string fg = config_get("video.frame_gen", "off");
+#if defined(__ANDROID__)
+    const char* fg_default = "builtin";  // on by default there (nvn_framegen.cpp)
+#else
+    const char* fg_default = "off";
+#endif
+    std::string fg = config_get("video.frame_gen", fg_default);
     Choices fg_choices = {{"off", console("video.framegen.off")}, {"builtin", tr("video.framegen.builtin")}};
     if (lsfg || fg == "lsfg") fg_choices.push_back({"lsfg", tr("video.framegen.lsfg")});
     const char* fg_desc = fg == "lsfg" ? (lsfg ? "video.framegen.desc" : "video.framegen.missing") : "video.framegen.builtin.desc";
-    row("video.framegen", fg_desc, [&](float w) { combo("video.frame_gen", "off", fg_choices, w); });
+    row("video.framegen", fg_desc, [&](float w) { combo("video.frame_gen", fg_default, fg_choices, w); });
     row("video.gpu", nullptr, [&](float w) {
         combo("video.gpu", "auto",
               {{"auto", tr("common.auto")}, {"discrete", tr("video.gpu.discrete")}, {"integrated", tr("video.gpu.integrated")}}, w);

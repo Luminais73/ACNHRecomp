@@ -134,8 +134,8 @@ bool write_watch_fault(void* at);
 // NX_HEADLESS=1: no visible window (it is created hidden) and nothing presented; frames still render and
 // NX_DUMP_FRAMES still writes them. For unattended test runs.
 bool headless();
-// Debug and test files polled in the data folder while the game runs (input_live, dump_frames, trace_cmds,
-// trace_draws, skip_fs, uw_probe, uw_cams). On Android the data folder is on shared storage (FUSE): each check of a
+// Test files polled in the data folder while the game runs (input_live, dump_frames, window_size; the debugging ones:
+// debug_files). On Android the data folder is on shared storage (FUSE): each check of a
 // file that is not there took milliseconds, on the replay thread (~15% of its time on a Snapdragon 865). There they are
 // off unless NX_LIVE=1 or a test run (NX_LIVE_FRAME); elsewhere on unless NX_LIVE=0.
 inline bool live_files() {
@@ -147,6 +147,12 @@ inline bool live_files() {
         return true;
 #endif
     }();
+    return on;
+}
+// Debugging files polled while the game runs (trace_cmds, trace_draws, skip_fs, uw_nosqueeze, uw_trace, uw_cams,
+// uw_probe): some were checked every 2000-3000 draws, ~500 file opens a second at 60 fps. Only with NX_DEBUG_FILES=1.
+inline bool debug_files() {
+    static const bool on = std::getenv("NX_DEBUG_FILES") && std::getenv("NX_DEBUG_FILES")[0] == '1';
     return on;
 }
 // Ends the process when its memory footprint passes NX_MEM_LIMIT_GB (default 8); logs it every 30 s (macOS).

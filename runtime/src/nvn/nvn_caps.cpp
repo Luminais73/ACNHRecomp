@@ -19,6 +19,7 @@ void log_device_caps(VkPhysicalDevice physical, const std::vector<VkExtensionPro
         "VK_EXT_extended_dynamic_state2",  "VK_EXT_extended_dynamic_state3",  "VK_GOOGLE_display_timing",
         "VK_KHR_present_wait",             "VK_KHR_present_id",               "VK_EXT_attachment_feedback_loop_layout",
         "VK_KHR_dynamic_rendering_local_read", "VK_QCOM_render_pass_store_ops", "VK_EXT_load_store_op_none",
+        "VK_EXT_external_memory_host",
     };
     std::string have, missing;
     for (const char* w : wanted) {

@@ -78,7 +78,7 @@ CmdList* submit_command_list(uint64_t handle) {
 int live_trace_cmds() {
     static int n = 0;
     static uint64_t next = 0;
-    if (uint64_t now = plat::monotonic_ns(); now >= next && plat::live_files()) {
+    if (uint64_t now = plat::monotonic_ns(); now >= next && plat::debug_files()) {
         next = now + 1'000'000'000;
         const std::string path = plat::data_root() + "/trace_cmds";
         if (FILE* f = plat::fopen_utf8(path, "rb")) {

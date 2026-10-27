@@ -891,7 +891,7 @@ void display_timing_log() {
 // present is handed to this thread instead, and the replay goes on with the next frame. Everything else that uses the
 // queue or the swapchain first waits for that present to be done (presenter_wait), or holds the queue lock for its
 // submit (vkQueueSubmit and vkQueuePresentKHR on one queue must not overlap).
-// NX_PRESENT_THREAD=1/0: on/off (default: on Android with frame generation).
+// NX_PRESENT_THREAD=1/0: on/off (default: on Android with frame generation, and on macOS).
 struct PendingPresent {
     VkFence before = VK_NULL_HANDLE;  // the image queued before it done on the GPU (g_gen_fence), or none
     VkSemaphore rendered = VK_NULL_HANDLE;
@@ -916,6 +916,10 @@ bool presenter_wanted() {
         if (e) return e[0] == '1';
 #if defined(__ANDROID__)
         return framegen_wanted();
+#elif defined(__APPLE__)
+        // MoltenVK: the present waits for the next drawable; off the replay thread the north walk's lowest windows on
+        // a warm M1 Air went from 53-56 to 57-59 fps.
+        return true;
 #else
         return false;
 #endif

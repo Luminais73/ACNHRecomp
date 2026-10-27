@@ -17,12 +17,16 @@ echo "== data folder on the phone: $D"
 adb shell mkdir -p "$D"
 
 # What the runtime reads (not shaders_extracted: an intermediate of the setup). A folder already there with as many
-# files is skipped: thousands of small files take minutes each time.
+# files and bytes is skipped: thousands of small files take minutes each time.
 for d in analysis spirv fonts exefs mods aoc; do
   [ -e "$SRC/$d" ] || continue
+  # Files and bytes: an updated translation has the same files with other contents.
   local_n=$(find -L "$SRC/$d" -type f | wc -l | tr -d ' ')
+  local_b=$(find -L "$SRC/$d" -type f -exec stat -f %z {} + 2>/dev/null || find -L "$SRC/$d" -type f -exec stat -c %s {} +)
+  local_b=$(echo "$local_b" | awk '{s += $1} END {print s + 0}')
   phone_n=$(adb shell "find $D/$d -type f 2>/dev/null | wc -l" | tr -d '\r ')
-  if [ "$local_n" = "$phone_n" ]; then echo "== $d: already there ($local_n files)"; continue; fi
+  phone_b=$(adb shell "find $D/$d -type f -exec stat -c %s {} + 2>/dev/null" | tr -d '\r' | awk '{s += $1} END {print s + 0}')
+  if [ "$local_n" = "$phone_n" ] && [ "$local_b" = "$phone_b" ]; then echo "== $d: already there ($local_n files)"; continue; fi
   echo "== $d ($local_n files)"
   adb push "$SRC/$d" "$D/" | tail -1
 done

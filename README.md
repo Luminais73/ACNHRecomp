@@ -121,7 +121,7 @@ GPU; see [docs/STATUS.md](docs/STATUS.md) for the full, regularly updated log.
 | Linux x86-64 | Tested (Ubuntu, clang 21, Intel Iris Xe / Mesa ANV) |
 | macOS (Apple Silicon, MoltenVK) | Tested (M1, macOS 26/27, Homebrew's MoltenVK) |
 | Windows x86-64 | Builds with `tools/setup_acnh.py` (clang-cl, SDL3); contributed by a fork, not tested here |
-| Android | Not supported yet |
+| Android (Snapdragon, Turnip) | Tested (Galaxy S20 FE / Snapdragon 865: 30 fps, 60 shown with frame generation); built on a computer from your own game, see [docs/ANDROID.md](docs/ANDROID.md) |
 
 ## Disclaimer
 

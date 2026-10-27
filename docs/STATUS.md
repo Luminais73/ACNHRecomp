@@ -168,7 +168,7 @@ Em aberto:
 Em 21:9 (`video.aspect`), dentro da Nook Inc. a imagem fica certa (com o `NX_UW_ORTHO` desligado, o padrão desde
 `dcb9289`). Na ilha, porém, o último quarto da tela à direita sai borrado em faixas horizontais, a partir de 1/k da
 largura (76% em 21:9), tanto em 1080 quanto em 1440. Em 16:9 a 1440 fica limpo. O que já se sabe:
-- todos os alvos de tela são alargados (um trace com o arquivo `uw_trace` na raiz mostra `wide 1`); o array
+- todos os alvos de tela são alargados (um trace com o arquivo `uw_trace` na raiz e `NX_DEBUG_FILES=1` mostra `wide 1`); o array
   960x540x2 fmt 0x11 da ilha passou a ser alargado em `dcb9289`, mas não era a causa;
 - descartar os passes de pós-processamento (`NX_SKIP_FS=fb8e3d25fa70ccb5,3f42705b617f3e52,92b733b47648169c,0ae22bc3aa4fedc9`)
   ou os que desenham no array (`2f9adfd53032cfd8,bfc1f66f7ee90900`) não tira as faixas;

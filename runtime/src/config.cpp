@@ -88,7 +88,8 @@ bool speedfix_installed() {
 std::string speedfix(const std::string& v) { return v == "60" && speedfix_installed() ? "1" : ""; }
 std::string interval(const std::string& v) { return (v == "60" && speedfix_installed()) || v == "60native" ? "1" : ""; }
 std::string native60(const std::string& v) { return v == "60native" ? "1" : ""; }
-std::string framegen(const std::string& v) { return v == "builtin" ? "1" : ""; }  // lsfg-vk is a Vulkan layer of its own
+// lsfg-vk is a Vulkan layer of its own. "off" says so: frame generation is on by default on Android.
+std::string framegen(const std::string& v) { return v == "builtin" ? "1" : v.empty() ? "" : "0"; }
 // The screen's 0..100% sharpness -> FSR's RCAS attenuation in stops (0 sharpest, 2 softest).
 std::string fsr_sharpness(const std::string& v) {
     if (v.empty()) return "";
