@@ -28,7 +28,6 @@
 extern char** environ;
 #endif
 #if defined(__ANDROID__)
-#include <dlfcn.h>
 #include <sched.h>
 #include <unistd.h>
 #endif
@@ -121,22 +120,6 @@ void place(int role) {
     sched_setaffinity(0, sizeof set, &set);
 }
 
-float thermal_headroom() {
-    using Acquire = void* (*)();
-    using Headroom = float (*)(void*, int);
-    static void* mgr = nullptr;
-    static Headroom headroom = nullptr;
-    static bool tried = false;
-    if (!tried) {
-        tried = true;
-        if (void* lib = dlopen("libandroid.so", RTLD_NOW)) {
-            auto acquire = reinterpret_cast<Acquire>(dlsym(lib, "AThermal_acquireManager"));
-            headroom = reinterpret_cast<Headroom>(dlsym(lib, "AThermal_getThermalHeadroom"));
-            if (acquire && headroom) mgr = acquire();
-        }
-    }
-    return mgr && headroom ? headroom(mgr, 0) : -1.0f;
-}
 #endif
 
 struct Role {
@@ -247,6 +230,7 @@ void frame_presented() {
     uint64_t now = monotonic_ns();
     if (last) {
         double ms = double(now - last) / 1e6;
+        thermal_frame(now - last);  // the thermal governor's late frames (thermal.cpp)
         bins[ms < 14 ? 0 : ms < 19 ? 1 : ms < 25 ? 2 : ms < 31 ? 3 : ms < 36 ? 4 : ms < 50 ? 5 : 6]++;
     }
     last = now;

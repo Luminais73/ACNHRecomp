@@ -439,6 +439,13 @@ void page_video() {
     row("video.async_shaders", "video.async_shaders.desc", [&](float w) { toggle("video.async_shaders", false, w); });
 #endif
 #if defined(__ANDROID__)
+    // Read live (thermal.cpp): no restart.
+    row("video.thermal", "video.thermal.desc", [&](float w) {
+        combo("video.thermal", "balanced",
+              {{"performance", tr("video.thermal.performance")}, {"balanced", tr("video.thermal.balanced")},
+               {"cool", tr("video.thermal.cool")}},
+              w);
+    });
     row("video.root_clocks", "video.root_clocks.desc", [&](float w) { toggle("video.root_clocks", false, w); });
 #endif
 }

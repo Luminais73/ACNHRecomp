@@ -1196,6 +1196,7 @@ void gpu_present(uint64_t texture, const int32_t* crop, int interval) {
         static uint64_t work0 = 0, up0 = 0;
         uint64_t work = g_timing.replay_ns + g_timing.encode_ns + g_timing.fence_ns, up = g_timing.upload_bytes;
         present_hitch_check(work >= work0 ? work - work0 : work, up >= up0 ? up - up0 : up);
+        plat::frame_replay_work(int64_t(work >= work0 ? work - work0 : work));  // ADPF and the thermal governor
         work0 = work, up0 = up;
     }
     PresentTimer timer;

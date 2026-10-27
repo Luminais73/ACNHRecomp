@@ -1,9 +1,9 @@
 // Performance hints (docs/nvn/ANDROID-PORT.md A5, DEBUG-2.md #84): on Android the threads that make a frame (the
 // game's render thread, which also replays NVN, and the presenting one) join an ADPF session (APerformanceHint,
-// Android 13+) with a 16.7 ms target, and each frame's duration is reported. The system then raises the big cores'
+// Android 13+) with the frame period as its target, and each frame's duration is reported. The system then raises the big cores'
 // clocks when a frame runs late instead of guessing from load, which on phones keeps a steady 60 fps cooler and faster
 // than the default governor. The API is looked up with dlsym, so older Android versions just go without.
-// NX_ADPF=0: off. Other platforms: nothing.
+// The target and the duration reported follow the thermal mode (thermal.cpp). NX_ADPF=0: off. Other platforms: nothing.
 #include "platform.h"
 
 #if defined(__ANDROID__)
@@ -19,7 +19,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
-#include <thread>
 #include <vector>
 
 #include <nx/runtime.h>
@@ -34,12 +33,16 @@ using GetManager = void* (*)();
 using CreateSession = void* (*)(void*, const int32_t*, size_t, int64_t);
 using ReportActual = int (*)(void*, int64_t);
 using CloseSession = void (*)(void*);
+using UpdateTarget = int (*)(void*, int64_t);
+using PreferEfficiency = int (*)(void*, bool);  // Android 15
 
 struct Api {
     GetManager get_manager = nullptr;
     CreateSession create = nullptr;
     ReportActual report = nullptr;
     CloseSession close = nullptr;
+    UpdateTarget update = nullptr;
+    PreferEfficiency efficiency = nullptr;
     bool ok = false;
 };
 
@@ -54,6 +57,8 @@ const Api& api() {
         x.create = reinterpret_cast<CreateSession>(dlsym(lib, "APerformanceHint_createSession"));
         x.report = reinterpret_cast<ReportActual>(dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
         x.close = reinterpret_cast<CloseSession>(dlsym(lib, "APerformanceHint_closeSession"));
+        x.update = reinterpret_cast<UpdateTarget>(dlsym(lib, "APerformanceHint_updateTargetWorkDuration"));
+        x.efficiency = reinterpret_cast<PreferEfficiency>(dlsym(lib, "APerformanceHint_setPreferPowerEfficiency"));
         x.ok = x.get_manager && x.create && x.report && x.close;
         return x;
     }();
@@ -64,6 +69,9 @@ std::mutex g_lock;
 std::vector<int32_t> g_tids;
 void* g_session = nullptr;
 bool g_dirty = false;
+int64_t g_target = 0;
+uint64_t g_target_at = 0;
+int g_efficiency = -1;  // what the session was told (-1: nothing yet)
 
 }  // namespace
 
@@ -95,38 +103,6 @@ void gpu_turbo() {
     // The descriptor stays open: the driver ties the setting to it.
 }
 
-// NX_ROOT_CLOCKS=1 (Android, rooted phones only; video.root_clocks in the settings): Samsung's system manager (SSRM)
-// caps the GPU through /sys/kernel/gpu/gpu_max_clock (441 of 587 MHz on a Galaxy S20 FE, even cold), which left the
-// game GPU-bound at ~25 fps. A root shell (su) puts the GPU's top clock back every few seconds, as SSRM sets it again.
-// The CPU caps are left alone: the replay did not get faster with them lifted (memory-bound), only hotter. Nothing
-// else is touched: the kernel's own thermal limits stay.
-void root_clocks() {
-    const char* e = std::getenv("NX_ROOT_CLOCKS");
-    if (!(e && e[0] == '1')) return;
-    std::thread([] {
-        set_thread_name("root clocks");
-        FILE* su = popen("su", "w");
-        if (!su) {
-            log("root clocks: su not available");
-            return;
-        }
-        log("root clocks: on (NX_ROOT_CLOCKS=1): the GPU's top clock kept available");
-        const char* cmd =
-            "G=/sys/kernel/gpu; K=/sys/class/kgsl/kgsl-3d0; "
-            "if [ -w $G/gpu_max_clock ] && [ -r $K/gpu_available_frequencies ]; then "
-            "m=0; for f in $(cat $K/gpu_available_frequencies); do [ $f -gt $m ] && m=$f; done; m=$((m / 1000000)); "
-            "[ \"$(cat $G/gpu_max_clock)\" = \"$m\" ] || echo $m > $G/gpu_max_clock; fi\n";
-        for (;;) {
-            if (std::fputs(cmd, su) < 0 || std::fflush(su) != 0) {
-                log("root clocks: the root shell ended");
-                pclose(su);
-                return;
-            }
-            sleep_ns(3'000'000'000ull);
-        }
-    }).detach();
-}
-
 void perf_hint_thread() {
     if (!api().ok) return;
     thread_local bool joined = false;
@@ -139,23 +115,43 @@ void perf_hint_thread() {
 }
 
 void perf_hint_frame(int64_t ns) {
+    thermal_main_work(ns);  // the governor's frame times (thermal.cpp)
     const Api& a = api();
     if (!a.ok || ns <= 0) return;
+    // Performance: as before: 33.3 ms when NX_FPS_CAP holds the game at 30 fps, else 16.7, and the game thread's work.
+    // Balanced and cool: the game's own period (its present interval, nvn_queue.cpp) times the mode's share. Unset,
+    // NX_FPS_CAP left the target at 16.7 ms while the game ran at 30 fps: every frame looked twice too long and the
+    // system kept the clocks up. The duration is the longer of the game's and the replay's work: the replay is the
+    // frame's other half, on other threads of the session.
+    const int mode = thermal_mode();
+    static const int64_t fixed = [] {
+        const char* cap = std::getenv("NX_FPS_CAP");
+        return cap && std::atoi(cap) > 0 && std::atoi(cap) <= 30 ? int64_t(33'333'333) : int64_t(16'666'667);
+    }();
+    int64_t target = fixed;
+    if (int64_t period = frame_period_ns(); mode != 0 && period > 0) target = int64_t(double(period) * thermal_adpf_share(mode));
     std::lock_guard lk(g_lock);
     if (g_dirty && !g_tids.empty()) {  // a new thread made part of the frame: a session with all of them
         if (g_session) a.close(g_session);
-        // The ADPF target is the frame period: 33.3 ms when NX_FPS_CAP holds the game at 30 fps (nvn_queue.cpp).
-        const char* cap = std::getenv("NX_FPS_CAP");
-        int64_t target = cap && std::atoi(cap) > 0 && std::atoi(cap) <= 30 ? 33'333'333 : 16'666'667;
         g_session = a.create(a.get_manager(), g_tids.data(), g_tids.size(), target);
-        g_dirty = false;
-        log("adpf: %s for %zu threads", g_session ? "session made" : "no session", g_tids.size());
+        g_dirty = false, g_target = target, g_efficiency = -1;
+        log("adpf: %s for %zu threads, target %.1f ms", g_session ? "session made" : "no session", g_tids.size(),
+            double(target) / 1e6);
     }
-    if (g_session) a.report(g_session, ns);
+    if (!g_session) return;
+    // A new target at most once a second: the game can switch between 30 and 60 fps often.
+    if (uint64_t now = monotonic_ns(); target != g_target && a.update && now - g_target_at > 1'000'000'000ull) {
+        a.update(g_session, target);
+        static int logged = 0;
+        if (logged++ < 20) log("adpf: target %.1f -> %.1f ms", double(g_target) / 1e6, double(target) / 1e6);
+        g_target = target, g_target_at = now;
+    }
+    // Cool: the system may pick efficient cores and clocks over meeting the target early (Android 15).
+    if (int eff = mode == 2; a.efficiency && eff != g_efficiency) a.efficiency(g_session, eff != 0), g_efficiency = eff;
+    a.report(g_session, mode == 0 ? ns : std::max(ns, frame_replay_work_ns()));
 }
 #else
 void gpu_turbo() {}
-void root_clocks() {}
 void perf_hint_thread() {}
 void perf_hint_frame(int64_t) {}
 #endif

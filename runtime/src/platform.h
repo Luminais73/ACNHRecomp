@@ -121,8 +121,20 @@ void set_gamepad_connected(bool connected);  // Android: a controller connected 
 // a frame's work took `ns`.
 void perf_hint_thread();
 void perf_hint_frame(int64_t ns);
-void gpu_turbo();
-void root_clocks();  // NX_ROOT_CLOCKS=1: a rooted Samsung phone's GPU clock cap lifted (perf_hint.cpp; Android)  // NX_GPU_TURBO=1: the Adreno GPU at its highest clock (perf_hint.cpp; Android)
+void gpu_turbo();  // NX_GPU_TURBO=1: the Adreno GPU at its highest clock (perf_hint.cpp; Android)
+// Thermal governor (thermal.cpp; Android, nothing elsewhere): video.thermal / NX_THERMAL, and with NX_ROOT_CLOCKS=1 the
+// GPU and big-core clock caps (a rooted phone).
+void thermal_start();             // after config_apply
+void thermal_pause(bool paused);  // the app in the background: the system's caps put back until it returns
+int thermal_mode();               // 0 performance, 1 balanced, 2 cool
+double thermal_adpf_share(int mode);  // the ADPF target as a share of the frame period
+float thermal_headroom();         // AThermal: 1 = severe throttling; -1 unknown
+void frame_period(int64_t ns);    // the game's frame period: its present interval (nvn_queue.cpp)
+int64_t frame_period_ns();        // 0 before the first present
+void frame_replay_work(int64_t ns);  // the replay thread's work for one frame (nvn_vk.cpp)
+int64_t frame_replay_work_ns();
+void thermal_main_work(int64_t ns);  // the game thread's work for one frame (perf_hint_frame)
+void thermal_frame(uint64_t interval_ns);  // one of the game's frames shown, this long after the last (frame_stats.cpp)
 // Frame threads and present intervals (frame_stats.cpp): the cores they run on, their CPU time, NX_AFFINITY.
 // role 0: the thread that replays and presents (frame_presented ticks it); 1: the game's main thread.
 void frame_thread_tick(int role);

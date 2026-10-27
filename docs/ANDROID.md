@@ -99,15 +99,33 @@ Open **ACNH Recomp** on the phone. The first start takes a minute or two: shader
 | Resolution | Auto | the rows the GPU keeps at 30 fps (900 on an Adreno 650), scaled to the screen |
 | Aspect | Auto | the phone's own shape (20:9), HUD at the edges |
 | Prepare shaders while loading / async shaders | on | new objects can show a few frames late instead of freezing the game |
-| Unlock GPU clock (root) | off | rooted Samsung phones only, see below |
+| Thermal mode | Balanced | see below |
+| Clock control (root) | off | rooted phones only, see below |
 
 ### Samsung phones: the GPU clock cap
 
 Samsung's system manager caps the GPU (441 of 587 MHz on the S20 FE) and the CPU, even with the phone cold. The game
-then runs at ~25 fps instead of 30. On a **rooted** phone, *Unlock GPU clock (root)* in the settings lifts the GPU cap
-while the game runs (the app asks Magisk for root once: allow it). The CPU caps are left alone: the game does not get
+then runs at ~25 fps instead of 30. On a **rooted** phone, *Clock control (root)* in the settings lifts the GPU cap
+while the game runs (the app asks Magisk for root once: allow it). The CPU caps are never raised: the game does not get
 faster with them, only warmer. A phone that gets hot (75-80 °C on the S20 FE after minutes of play) throttles by
 itself; a cooler helps.
+
+### Thermal mode
+
+*Thermal mode* (`video.thermal`; `NX_THERMAL=performance|balanced|cool` in `config.txt` wins over it, for tests) sets
+how warm the phone may get (runtime/src/thermal.cpp):
+
+- On every phone, the system's performance hints (ADPF) get the game's real frame period as the target (33.3 ms at
+  30 fps, less a margin: 15% balanced, 5% cool) instead of 16.7 ms, which kept the clocks up for nothing.
+- With *Clock control (root)*, every 2 s the GPU clock cap and the big cores' cap go to the lowest steps that hold the
+  frame time (balanced: the GPU at most 85% busy, the CPU work at most 80% of the frame; cool: 96% and 88%, and a few
+  late frames allowed). Late frames raise them at once. Hot (Android's thermal headroom or the CPU at 75 °C balanced,
+  68 °C cool) lowers the ceilings a step (cool: two) before Samsung's own throttling. The log says why
+  (`thermal:` lines), and a status line every 30 s.
+- *Performance* is the behaviour before: with root, the GPU's top clock; the CPU as the system sets it.
+
+Every cap written is put back when the game goes to the background and when it ends (the root shell restores them
+when the app's end of its socket closes: also after a crash or a kill).
 
 ## Measured (Galaxy S20 FE, island, 900 rows, frame generation)
 

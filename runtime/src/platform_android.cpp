@@ -644,9 +644,11 @@ void on_cmd(android_app* app, int32_t cmd) {
             break;
         case APP_CMD_PAUSE:  // home, app switcher, screen off: the game holds (no window), so does its sound
             audio_pause(true);
+            thermal_pause(true);  // and the phone gets the system's clock caps back
             break;
         case APP_CMD_RESUME:
             audio_pause(false);
+            thermal_pause(false);
             break;
     }
 }
@@ -901,7 +903,7 @@ extern "C" void android_main(android_app* app) {
     }
     start_memory_guard();
     gpu_turbo();
-    root_clocks();
+    thermal_start();  // thermal.cpp: the thermal mode, and the clock caps on a rooted phone (NX_ROOT_CLOCKS=1)
     app->onAppCmd = on_cmd;
     app->onInputEvent = on_input;
     // NX_SHOW_WHEN_LOCKED=1 (unattended test runs, tools/wonder_phone_course.sh): shown over the lock screen and turning

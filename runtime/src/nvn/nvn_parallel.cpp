@@ -288,6 +288,7 @@ void worker_main(int w) {
         if (w == 0) log("nvn/vk: parallel replay workers at nice %d (%s)", nice, r == 0 ? "ok" : std::strerror(errno));
     }
 #endif
+    plat::perf_hint_thread();  // part of the frame: in the ADPF session (perf_hint.cpp)
     uint64_t seen = 0;
     for (;;) {
         {
