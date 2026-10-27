@@ -16,7 +16,7 @@ namespace nx::nvn::replay {
 
 using namespace nx::vk;
 
-DrawTextures g_textures;
+PerThread<DrawTextures> g_textures;
 
 bool draw_slow(uint32_t what) {
     static const uint32_t mask = [] {
@@ -53,14 +53,14 @@ void lookup_handle(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, Vie
     if (view) *view = {};
     // The pools' maps are read under the objects lock, and at the replay's mark (nvn_incarnation.cpp): the game's
     // recording thread registers the next frame's slots meanwhile (98% of the registrations, DEBUG.md #56).
-    auto* tp = get<DescriptorPool>(g_state.texture_pool);
-    auto* sp = get<DescriptorPool>(g_state.sampler_pool);
+    auto* tp = get<DescriptorPool>((*g_state).texture_pool);
+    auto* sp = get<DescriptorPool>((*g_state).sampler_pool);
     PoolEntry e;
     {
         std::shared_lock lk(objects_lock());
         // A slot empty at the mark was registered after the lists were recorded but before the submit: the current
         // entry (NVN reads descriptors when the GPU runs; DEBUG.md #64). NX_MARK_EMPTY_OLD=1: the empty entry.
-        if (tp && (!pool_entry_at(g_state.texture_pool, tid, replay_tls().mark, e) || (!e.has && !mark_empty_old()))) {
+        if (tp && (!pool_entry_at((*g_state).texture_pool, tid, replay_tls().mark, e) || (!e.has && !mark_empty_old()))) {
             e = {};
             if (auto it = tp->textures.find(tid); it != tp->textures.end()) e.has = true, e.texture = it->second;
             if (auto it = tp->snapshots.find(tid); it != tp->snapshots.end()) e.snapshot = it->second;
@@ -69,7 +69,7 @@ void lookup_handle(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, Vie
         SamplerSlot ss;
         // A slot empty at the mark was registered after the lists were recorded but before the submit (NVN reads
         // descriptors when the GPU runs): the current entry is the one.
-        if (sp && sampler_entry_at(g_state.sampler_pool, sid, replay_tls().mark, ss) && ss.has) {
+        if (sp && sampler_entry_at((*g_state).sampler_pool, sid, replay_tls().mark, ss) && ss.has) {
             sampler = ss.info;
             if (has_sampler) *has_sampler = true;
         } else if (sp) {
@@ -113,11 +113,11 @@ void lookup_handle(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, Vie
 // NX_FRAME_SIG's watched draws: how a handle's texture slot resolves (the mark's entry against the current one).
 std::string explain_texture_slot(uint64_t handle) {
     uint32_t sid = 0, tid = handle_texture(handle, &sid);
-    auto* tp = get<DescriptorPool>(g_state.texture_pool);
+    auto* tp = get<DescriptorPool>((*g_state).texture_pool);
     if (!tp) return "no pool";
     std::shared_lock lk(objects_lock());
     PoolEntry e;
-    bool at_mark = pool_entry_at(g_state.texture_pool, tid, replay_tls().mark, e);
+    bool at_mark = pool_entry_at((*g_state).texture_pool, tid, replay_tls().mark, e);
     auto cur = tp->textures.find(tid);
     auto cs = tp->snapshots.find(tid);
     auto desc = [](uint64_t key) {
@@ -147,7 +147,7 @@ namespace {
 // image's state is not cached (sampled_ready and sampled_view run for every draw). Open addressing, no removal;
 // emptied by bumping the generation.
 struct HandleSlot {
-    uint64_t generation = 0;  // g_handle_generation when filled
+    uint64_t generation = 0;  // (*g_handle_generation) when filled
     uint64_t handle = 0, texture_pool = 0, sampler_pool = 0;  // the key (handle: its 32 bits)
     uint64_t texture = 0;       // as lookup_handle gives it
     Texture* object = nullptr;  // get<Texture>(texture)
@@ -157,34 +157,34 @@ struct HandleSlot {
     VkSampler vk_sampler[2] = {};  // sampler_for(sampler, shadow), once a binding asked
 };
 constexpr uint32_t kHandleSlots = 2048;  // a course frame names a few hundred handles
-HandleSlot g_handle_slots[kHandleSlots];
-uint64_t g_handle_generation = 1, g_handle_mark = 0;
-uint32_t g_handle_used = 0;
-uint64_t g_handle_hits = 0, g_handle_misses = 0, g_sets_skipped = 0;
+PerThread<TlsArray<HandleSlot, kHandleSlots>> g_handle_slots;
+PerThread<uint64_t> g_handle_generation{1}, g_handle_mark;
+PerThread<uint32_t> g_handle_used;
+PerThread<uint64_t> g_handle_hits, g_handle_misses, g_sets_skipped;
 
-void handles_reset() { g_handle_generation++, g_handle_used = 0; }
+void handles_reset() { (*g_handle_generation)++, (*g_handle_used) = 0; }
 
 // The slot of `handle` in the bound pools, filled on first use; null without a replay mark (NX_TEXTURE_RACE_OLD: a
 // lookup then answers as of now) or with NX_DRAW_SLOW. Valid until the next call.
 HandleSlot* handle_slot(uint64_t handle) {
     uint64_t mark = replay_tls().mark;
     if (!mark || draw_slow(kSlowHandles)) return nullptr;
-    if (mark != g_handle_mark || g_handle_used > kHandleSlots / 2) handles_reset(), g_handle_mark = mark;
+    if (mark != (*g_handle_mark) || (*g_handle_used) > kHandleSlots / 2) handles_reset(), (*g_handle_mark) = mark;
     handle &= 0xFFFFFFFFull;  // 20 bits of texture id, 12 of sampler id
-    uint64_t tp = g_state.texture_pool, sp = g_state.sampler_pool;
+    uint64_t tp = (*g_state).texture_pool, sp = (*g_state).sampler_pool;
     uint64_t h = (handle + 1) * 0x9E3779B97F4A7C15ull ^ tp * 0xC2B2AE3D27D4EB4Full ^ sp * 0x165667B19E3779F9ull;
     for (uint32_t k = uint32_t(h >> 40);; k++) {
-        HandleSlot& s = g_handle_slots[k & (kHandleSlots - 1)];
-        if (s.generation == g_handle_generation) {
+        HandleSlot& s = (*g_handle_slots)[k & (kHandleSlots - 1)];
+        if (s.generation == (*g_handle_generation)) {
             if (s.handle != handle || s.texture_pool != tp || s.sampler_pool != sp) continue;
-            g_handle_hits++;
+            (*g_handle_hits)++;
             return &s;
         }
         s = HandleSlot{};
-        s.generation = g_handle_generation, s.handle = handle, s.texture_pool = tp, s.sampler_pool = sp;
+        s.generation = (*g_handle_generation), s.handle = handle, s.texture_pool = tp, s.sampler_pool = sp;
         lookup_handle(handle, s.texture, s.sampler, &s.view, &s.has_sampler);
         s.object = s.texture ? get<Texture>(s.texture) : nullptr;
-        g_handle_used++, g_handle_misses++;
+        (*g_handle_used)++, (*g_handle_misses)++;
         return &s;
     }
 }
@@ -222,25 +222,26 @@ struct ConstantsBlock {
     std::array<uint8_t, 0x1000> bytes;
 };
 constexpr size_t kBlocks = 32;  // more distinct ones in a submit: copied per draw, as before
-std::vector<std::unique_ptr<SupportBlock>> g_support;
-std::vector<std::unique_ptr<ConstantsBlock>> g_constants;
-size_t g_support_used = 0, g_constants_used = 0;
+PerThread<std::vector<std::unique_ptr<SupportBlock>>> g_support;
+PerThread<std::vector<std::unique_ptr<ConstantsBlock>>> g_constants;
+PerThread<size_t> g_support_used, g_constants_used;
 
 const SupportBuffer* support_block(float width, float height, const RenderScales& scales) {
     // The last block found first: runs of draws (and the two stages of a draw) ask for the same one.
-    static size_t last = 0;
+    static PerThread<size_t> last_pt;
+    auto& last = *last_pt;
     auto same = [&](size_t k) {
-        return std::memcmp(&g_support[k]->width, &width, 4) == 0 && std::memcmp(&g_support[k]->height, &height, 4) == 0 &&
-               std::memcmp(&g_support[k]->scales, &scales, sizeof scales) == 0;
+        return std::memcmp(&(*g_support)[k]->width, &width, 4) == 0 && std::memcmp(&(*g_support)[k]->height, &height, 4) == 0 &&
+               std::memcmp(&(*g_support)[k]->scales, &scales, sizeof scales) == 0;
     };
-    if (last < g_support_used && same(last)) return &g_support[last]->sb;
-    for (size_t k = 0; k < g_support_used; k++)
-        if (same(k)) return &g_support[last = k]->sb;
-    if (g_support_used == kBlocks) return nullptr;
-    if (g_support_used == g_support.size()) g_support.push_back(std::make_unique<SupportBlock>());
-    SupportBlock& b = *g_support[g_support_used++];
+    if (last < (*g_support_used) && same(last)) return &(*g_support)[last]->sb;
+    for (size_t k = 0; k < (*g_support_used); k++)
+        if (same(k)) return &(*g_support)[last = k]->sb;
+    if ((*g_support_used) == kBlocks) return nullptr;
+    if ((*g_support_used) == (*g_support).size()) (*g_support).push_back(std::make_unique<SupportBlock>());
+    SupportBlock& b = *(*g_support)[(*g_support_used)++];
     b.width = width, b.height = height, b.scales = scales;
-    last = g_support_used - 1;
+    last = (*g_support_used) - 1;
     b.sb = support_buffer_defaults();
     support_buffer_set_viewport(b.sb, width, height, false, scales.rt);
     apply_scales(b.sb, scales);
@@ -250,20 +251,21 @@ const SupportBuffer* support_block(float width, float height, const RenderScales
 const uint8_t* constants_block(ShaderStage stage, int st) {
     if (stage == ShaderStage::Compute) return nullptr;  // its table also lists the uniform blocks; a few per frame
     int hw = stage == ShaderStage::Fragment ? 4 : 0;
-    const Range* key = g_state.storage[st];
-    static size_t last[2] = {};  // per Maxwell stage, as support_block
+    const Range* key = (*g_state).storage[st];
+    static PerThread<size_t[2]> last_pt;  // per Maxwell stage, as support_block
+    auto& last = *last_pt;
     auto same = [&](size_t k) {
-        return g_constants[k]->hw == hw && std::memcmp(g_constants[k]->storage, key, sizeof g_constants[k]->storage) == 0;
+        return (*g_constants)[k]->hw == hw && std::memcmp((*g_constants)[k]->storage, key, sizeof (*g_constants)[k]->storage) == 0;
     };
     size_t& l = last[hw ? 1 : 0];
-    if (l < g_constants_used && same(l)) return g_constants[l]->bytes.data();
-    for (size_t k = 0; k < g_constants_used; k++)
-        if (same(k)) return g_constants[l = k]->bytes.data();
-    if (g_constants_used == kBlocks) return nullptr;
-    if (g_constants_used == g_constants.size()) g_constants.push_back(std::make_unique<ConstantsBlock>());
-    ConstantsBlock& b = *g_constants[g_constants_used++];
+    if (l < (*g_constants_used) && same(l)) return (*g_constants)[l]->bytes.data();
+    for (size_t k = 0; k < (*g_constants_used); k++)
+        if (same(k)) return (*g_constants)[l = k]->bytes.data();
+    if ((*g_constants_used) == kBlocks) return nullptr;
+    if ((*g_constants_used) == (*g_constants).size()) (*g_constants).push_back(std::make_unique<ConstantsBlock>());
+    ConstantsBlock& b = *(*g_constants)[(*g_constants_used)++];
     b.hw = hw;
-    l = g_constants_used - 1;
+    l = (*g_constants_used) - 1;
     std::memcpy(b.storage, key, sizeof b.storage);
     b.bytes = driver_constants(stage, st);
     return b.bytes.data();
@@ -297,13 +299,33 @@ uint64_t pad_min(uint64_t want) {
 
 // guest: the bytes are guest memory (a copy is shared by later draws of the submit); host scratch data (the support
 // buffer, c[0]: on the stack, at the same address for every draw) is copied every time (docs/nvn/DEBUG.md #30).
+// In front of read_upload: the bytes given the same way earlier in this upload epoch ((*g_upload_epoch), nvn_vk.h) are
+// that copy. ~25,000 of the ~28,000 uniform blocks a frame bound on the S20 FE's island were such repeats, and each
+// went through the compute-written and late write-back checks and dedup's lookups again (~0.3 us, 8 ms a frame). Only
+// plain copies are remembered (not ranges a dispatch of this submit wrote). NX_UPLOAD_MEMO=0: off.
+struct BufMemo {
+    const uint8_t* p = nullptr;
+    uint64_t size = 0, n = 0, epoch = 0;
+    VkDescriptorBufferInfo info{};
+};
+PerThread<TlsArray<BufMemo, 2048>> g_buf_memo;
+PerThread<uint64_t> g_memo_hits, g_memo_misses;
+
 VkDescriptorBufferInfo buffer_of(VkCommandBuffer cb, const void* bytes, uint64_t size, uint64_t min_size = 16,
                                  bool write_back = false, bool guest = true) {
     uint64_t n = std::max<uint64_t>((size + 15) & ~15ull, min_size);
     const auto* p = static_cast<const uint8_t*>(bytes);
     if (!write_back && guest) {
+        static const bool memo = !(std::getenv("NX_UPLOAD_MEMO") && std::getenv("NX_UPLOAD_MEMO")[0] == '0');
+        BufMemo& m = (*g_buf_memo)[(uintptr_t(p) >> 4 ^ uintptr_t(p) >> 15 ^ size * 0x9E37u) & 2047];
+        if (memo && p && m.p == p && m.size == size && m.n == n && m.epoch == (*g_upload_epoch)) {
+            (*g_memo_hits)++;
+            return m.info;
+        }
         Upload u = read_upload(cb, p, size, n, 256);
-        return {u.buffer, u.offset, n};
+        VkDescriptorBufferInfo info{u.buffer, u.offset, n};
+        if (memo && p && size && !written_overlaps(p, size)) m = {p, size, n, (*g_upload_epoch), info}, (*g_memo_misses)++;
+        return info;
     }
     if (write_back && p && size && !written_separate()) {
         Upload u = written_bind(cb, p, size, n);
@@ -335,7 +357,7 @@ struct Descriptors {
     uint64_t dynamic = 0;              // set 0 bindings given a dynamic offset (ProgramLayout::dynamic)
     uint32_t dynamic_offset[64] = {};  // their ring offsets, by binding
 };
-Descriptors g_sets;
+PerThread<Descriptors> g_sets;
 
 // The set cache (docs/nvn/android-perf/PLAN.md R3): a set with the same layout and the same writes as one made earlier
 // in this submit is that set. Every draw allocated and wrote up to four sets (~1,500 allocations and ~5,000 writes per
@@ -345,14 +367,15 @@ Descriptors g_sets;
 struct CachedSet {
     uint64_t generation = 0, hash = 0;
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
-    uint32_t at = 0, n = 0;  // its writes in g_set_arena
+    uint32_t at = 0, n = 0;  // its writes in (*g_set_arena)
     VkDescriptorSet set = VK_NULL_HANDLE;
 };
 constexpr uint32_t kSetSlots = 8192;
-CachedSet g_set_cache[kSetSlots];
-std::vector<SetWrite> g_set_arena;
-uint64_t g_set_generation = 1, g_set_hits = 0, g_set_misses = 0, g_set_hits_by[4] = {}, g_set_misses_by[4] = {};
-uint32_t g_set_used = 0;
+PerThread<TlsArray<CachedSet, kSetSlots>> g_set_cache;
+PerThread<std::vector<SetWrite>> g_set_arena;
+PerThread<uint64_t> g_set_generation{1}, g_set_hits, g_set_misses;
+PerThread<uint64_t[4]> g_set_hits_by, g_set_misses_by;
+PerThread<uint32_t> g_set_used;
 
 bool set_cache_on() {
     static const bool on = [] {
@@ -371,7 +394,7 @@ uint64_t handle_bits(H h) {
 
 // d.sets from the cache or newly made, the writes of the cached ones dropped and the rest pointed at their new sets.
 void resolve_sets(const ProgramLayout& layout) {
-    Descriptors& d = g_sets;
+    Descriptors& d = (*g_sets);
     for (uint32_t k = 0; k < 4; k++) {
         d.key.clear();
         uint64_t h = handle_bits(layout.sets[k]) * 0x9E3779B97F4A7C15ull;
@@ -393,25 +416,25 @@ void resolve_sets(const ProgramLayout& layout) {
         if (d.key.empty()) continue;
         CachedSet* slot = nullptr;
         for (uint32_t probe = uint32_t(h >> 32);; probe++) {
-            CachedSet& c = g_set_cache[probe & (kSetSlots - 1)];
-            if (c.generation != g_set_generation) {
+            CachedSet& c = (*g_set_cache)[probe & (kSetSlots - 1)];
+            if (c.generation != (*g_set_generation)) {
                 slot = &c;
                 break;
             }
             if (c.hash == h && c.layout == layout.sets[k] && c.n == d.key.size() &&
-                std::memcmp(&g_set_arena[c.at], d.key.data(), d.key.size() * sizeof(SetWrite)) == 0) {
-                d.sets[k] = c.set, g_set_hits++, g_set_hits_by[k]++;
+                std::memcmp(&(*g_set_arena)[c.at], d.key.data(), d.key.size() * sizeof(SetWrite)) == 0) {
+                d.sets[k] = c.set, (*g_set_hits)++, (*g_set_hits_by)[k]++;
                 break;
             }
         }
         if (d.sets[k]) continue;
-        d.sets[k] = descriptor_set(layout.sets[k]), g_set_misses++, g_set_misses_by[k]++;
+        d.sets[k] = descriptor_set(layout.sets[k]), (*g_set_misses)++, (*g_set_misses_by)[k]++;
         for (size_t i = 0; i < d.writes.size(); i++)
             if (d.set_index[i] == k) d.writes[i].dstSet = d.sets[k];
-        if (!d.sets[k] || g_set_used >= kSetSlots / 2) continue;
-        *slot = {g_set_generation, h, layout.sets[k], uint32_t(g_set_arena.size()), uint32_t(d.key.size()), d.sets[k]};
-        g_set_arena.insert(g_set_arena.end(), d.key.begin(), d.key.end());
-        g_set_used++;
+        if (!d.sets[k] || (*g_set_used) >= kSetSlots / 2) continue;
+        *slot = {(*g_set_generation), h, layout.sets[k], uint32_t((*g_set_arena).size()), uint32_t(d.key.size()), d.sets[k]};
+        (*g_set_arena).insert((*g_set_arena).end(), d.key.begin(), d.key.end());
+        (*g_set_used)++;
     }
     size_t kept = 0;  // the writes of new sets only
     for (size_t i = 0; i < d.writes.size(); i++)
@@ -431,12 +454,12 @@ void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, ViewI
     if (view) *view = s->view;
 }
 
-// Descriptor sets for a program's stages from the bound state: buffers (sets 0/1), textures (set 2, g_textures as
+// Descriptor sets for a program's stages from the bound state: buffers (sets 0/1), textures (set 2, (*g_textures) as
 // gather_textures left them), storage images (set 3). Records uploads and layout changes, so it runs outside render
 // passes when textures or images need them. A set is allocated when its first binding is written: the sets no stage
 // declares anything in (usually two of the four) are neither allocated nor bound.
 void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shaders, const ProgramLayout& layout) {
-    Descriptors& d = g_sets;
+    Descriptors& d = (*g_sets);
     if (draw_slow(kSlowScratch))
         d = Descriptors{};
     else
@@ -454,23 +477,23 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
     auto& buffers = d.buffers;
     auto& images = d.images;
     buffers.reserve(1024), images.reserve(1024), writes.reserve(2048);  // pointers into them are kept
-    float vw = g_state.has_viewport ? float(g_state.viewport[2]) : 1280.0f;
-    float vh = g_state.has_viewport ? float(g_state.viewport[3]) : 720.0f;
+    float vw = (*g_state).has_viewport ? float((*g_state).viewport[2]) : 1280.0f;
+    float vh = (*g_state).has_viewport ? float((*g_state).viewport[3]) : 720.0f;
     RenderScales scales;
-    if (g_uw.on && g_state.has_viewport) {  // screen scale: the viewport the shaders see is the scaled one
-        int32_t x = g_state.viewport[0], w = g_state.viewport[2], y = g_state.viewport[1], h = g_state.viewport[3];
-        uw_span(x, w, UINT32_MAX, g_uw.sx);
-        uw_span(y, h, UINT32_MAX, g_uw.sy);
+    if ((*g_uw).on && (*g_state).has_viewport) {  // screen scale: the viewport the shaders see is the scaled one
+        int32_t x = (*g_state).viewport[0], w = (*g_state).viewport[2], y = (*g_state).viewport[1], h = (*g_state).viewport[3];
+        uw_span(x, w, UINT32_MAX, (*g_uw).sx);
+        uw_span(y, h, UINT32_MAX, (*g_uw).sy);
         vw = float(w), vh = float(h);
     }
     if (uw_scaling()) {
-        if (g_uw.on) scales.rt = g_uw.s();
+        if ((*g_uw).on) scales.rt = (*g_uw).s();
         const ShaderInfo* fs = nullptr;
         for (const ShaderInfo* s : shaders)
             if (s->stage == ShaderStage::Fragment) fs = s;
         if (fs)
             for (const DescriptorBinding& b : fs->refl.bindings) scales.frag_count += b.set == 2 || b.set == 3;
-        const DrawTextures& tex = g_textures;
+        const DrawTextures& tex = (*g_textures);
         for (size_t k = 0; k < tex.bindings.size() && k < tex.resolved.size() && scales.n < 16; k++) {
             auto [s, b] = tex.bindings[k];
             GpuImage* img = tex.resolved[k].texture ? image_of(tex.resolved[k].texture) : nullptr;
@@ -480,7 +503,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
             uint32_t rank = 0;  // the translator numbers a stage's textures in binding order
             for (const DescriptorBinding& o : s->refl.bindings) rank += o.set == 2 && o.binding < b->binding;
             bool frag = s->stage == ShaderStage::Fragment;
-            if (frag && g_uw.on && std::fabs(g_uw.s() - v) < 1e-3f) v = -v;
+            if (frag && (*g_uw).on && std::fabs((*g_uw).s() - v) < 1e-3f) v = -v;
             scales.index[scales.n] = uint8_t(std::min<uint32_t>(frag || s->stage == ShaderStage::Compute ? rank : rank + uint32_t(scales.frag_count), 255));
             scales.value[scales.n++] = v;
         }
@@ -503,7 +526,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
     };
     // A storage binding's bytes, and whether this compute stage writes them.
     auto storage = [](const ShaderInfo* s, const DescriptorBinding& b, int st, const uint8_t*& p, uint64_t& size) {
-        const Range& r = b.nvn.index >= 0 && b.nvn.index < 16 ? g_state.storage[st][b.nvn.index] : Range{};
+        const Range& r = b.nvn.index >= 0 && b.nvn.index < 16 ? (*g_state).storage[st][b.nvn.index] : Range{};
         p = r.address ? guest_bytes(r.address) : nullptr;
         size = p ? std::min<uint64_t>(r.size, 16ull << 20) : 0;
         return s->stage == ShaderStage::Compute &&
@@ -529,7 +552,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                 case NvnSource::ConstantData: info = buffer_of(cb, s->constants.data(), s->constants.size()); break;
                 case NvnSource::UniformBlock:
                 case NvnSource::UniformAsStorage: {
-                    const Range& r = b.nvn.index >= 0 && b.nvn.index < 18 ? g_state.uniforms[st][b.nvn.index] : Range{};
+                    const Range& r = b.nvn.index >= 0 && b.nvn.index < 18 ? (*g_state).uniforms[st][b.nvn.index] : Range{};
                     const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
                     // Reads past the bound size return 0 on Maxwell and garbage on Metal (a UI shader read c3[10]
                     // of a 0x90-byte block and wrote Inf): the bound data goes in a zero-padded 4 KB at least.
@@ -601,7 +624,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
         }
     }
     draw_part(6);
-    const DrawTextures& t = g_textures;
+    const DrawTextures& t = (*g_textures);
     for (size_t k = 0; k < t.bindings.size(); k++) {
         auto [s, b] = t.bindings[k];
         const ResolvedTexture r = k < t.resolved.size() ? t.resolved[k] : ResolvedTexture{};
@@ -625,7 +648,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
         for (const DescriptorBinding& b : s->refl.bindings) {
             if (b.set != 3) continue;
             uint64_t handle = b.nvn.source == NvnSource::ImageBinding && b.nvn.index >= 0 && b.nvn.index < 16
-                                  ? g_state.images[st][b.nvn.index]
+                                  ? (*g_state).images[st][b.nvn.index]
                                   : 0;
             uint64_t texture = 0;
             SamplerInfo si;
@@ -650,7 +673,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
 // sets build_sets allocated are bound, in ascending order (each bind leaves the lower sets, bound with this same
 // layout, undisturbed).
 void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayout& layout) {
-    Descriptors& d = g_sets;
+    Descriptors& d = (*g_sets);
     if (set_cache_on()) resolve_sets(layout);
     draw_part(8);
     if (!d.writes.empty()) p_vkUpdateDescriptorSets(vk_device(), uint32_t(d.writes.size()), d.writes.data(), 0, nullptr);
@@ -668,7 +691,7 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
     }
     for (uint32_t k = 0; k < 4;) {
         if (!d.sets[k]) {
-            k++, g_sets_skipped++;
+            k++, (*g_sets_skipped)++;
             continue;
         }
         uint32_t n = 1;
@@ -678,14 +701,16 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
     }
 }
 
-// Texture bindings of a program's stages and their handles, into g_textures. kNeedBreak: one needs a transfer or a
+// Texture bindings of a program's stages and their handles, into (*g_textures). kNeedBreak: one needs a transfer or a
 // layout change (so no render pass may be open while the sets are built); kSampledPending: one has a pending clear.
 uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
-    DrawTextures& t = g_textures;
+    DrawTextures& t = (*g_textures);
     // The bindings depend on the stages only: kept while runs of draws use the same program (they were rebuilt for each
     // of ~5000 draws a frame, with the per-draw vectors zero filled: 0.7 ms a frame at 60 fps).
-    static std::vector<const ShaderInfo*> last_shaders;
-    static uint32_t last_out = 0;
+    static PerThread<std::vector<const ShaderInfo*>> last_shaders_pt;
+    auto& last_shaders = *last_shaders_pt;
+    static PerThread<uint32_t> last_out_pt;
+    auto& last_out = *last_out_pt;
     uint32_t out = 0;
     if (draw_slow(kSlowScratch)) {
         t = DrawTextures{}, last_shaders.clear();
@@ -701,6 +726,7 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
             }
         last_shaders = shaders, last_out = out;
     }
+    if ((out & kNeedBreak) && worker_bail("storage image")) return out;  // storage images change layout: the replay thread's
     t.handles.resize(t.bindings.size());
     t.resolved.resize(t.bindings.size());  // every field is set below
     draw_part(10);
@@ -710,9 +736,9 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
         int st = api_stage(s->stage);
         uint64_t handle = 0;
         if (b->nvn.source == NvnSource::SamplerBinding && b->nvn.index >= 0 && b->nvn.index < 32)
-            handle = g_state.textures[st][b->nvn.index];
+            handle = (*g_state).textures[st][b->nvn.index];
         else if (b->nvn.source == NvnSource::HandleInUniform && b->nvn.bank >= 3) {
-            const Range& r = g_state.uniforms[st][b->nvn.bank - 3];
+            const Range& r = (*g_state).uniforms[st][b->nvn.bank - 3];
             const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
             if (p && uint64_t(b->nvn.word) * 4 + 4 <= r.size) handle = *reinterpret_cast<const uint32_t*>(p + b->nvn.word * 4);
         }
@@ -736,7 +762,10 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
                 texture = 0;
         }
         r.texture = texture;
-        if (texture ? !sampled_ready(texture) : !dummy_ready(b->image)) out |= kNeedBreak;
+        if (texture ? !sampled_ready(texture) : !dummy_ready(b->image)) {
+            if (worker_bail(texture ? "texture not ready" : "dummy not made")) return out;  // an upload or a dummy to make: the replay thread's
+            out |= kNeedBreak;
+        }
         if (!texture) continue;
         GpuImage* img = image_of(texture);
         // Sampling one of the open pass's targets (a depth buffer read back by the character lighting) needs what
@@ -775,22 +804,25 @@ bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, 
 
 void sets_begin_submit() {
     handles_reset();
-    g_set_generation++, g_set_used = 0, g_set_arena.clear();
-    g_support_used = g_constants_used = 0;
+    (*g_set_generation)++, (*g_set_used) = 0, (*g_set_arena).clear();
+    (*g_support_used) = (*g_constants_used) = 0;
 }
 
 void sets_log() {
-    if (g_handle_hits + g_handle_misses + g_sets_skipped)
+    if ((*g_memo_hits) + (*g_memo_misses))
+        log("nvn: upload memo: %llu hits, %llu misses", (unsigned long long)(*g_memo_hits), (unsigned long long)(*g_memo_misses));
+    (*g_memo_hits) = (*g_memo_misses) = 0;
+    if ((*g_handle_hits) + (*g_handle_misses) + (*g_sets_skipped))
         log("nvn: texture handles: %llu from the submit's cache, %llu looked up; %llu empty descriptor sets skipped",
-            (unsigned long long)g_handle_hits, (unsigned long long)g_handle_misses, (unsigned long long)g_sets_skipped);
-    if (g_set_hits + g_set_misses)
+            (unsigned long long)(*g_handle_hits), (unsigned long long)(*g_handle_misses), (unsigned long long)(*g_sets_skipped));
+    if ((*g_set_hits) + (*g_set_misses))
         log("nvn: descriptor sets: %llu reused from the submit's cache, %llu made (per set: %llu/%llu %llu/%llu %llu/%llu "
-            "%llu/%llu)", (unsigned long long)g_set_hits, (unsigned long long)g_set_misses,
-            (unsigned long long)g_set_hits_by[0], (unsigned long long)g_set_misses_by[0], (unsigned long long)g_set_hits_by[1],
-            (unsigned long long)g_set_misses_by[1], (unsigned long long)g_set_hits_by[2], (unsigned long long)g_set_misses_by[2],
-            (unsigned long long)g_set_hits_by[3], (unsigned long long)g_set_misses_by[3]);
-    for (int k = 0; k < 4; k++) g_set_hits_by[k] = g_set_misses_by[k] = 0;
-    g_handle_hits = g_handle_misses = g_sets_skipped = g_set_hits = g_set_misses = 0;
+            "%llu/%llu)", (unsigned long long)(*g_set_hits), (unsigned long long)(*g_set_misses),
+            (unsigned long long)(*g_set_hits_by)[0], (unsigned long long)(*g_set_misses_by)[0], (unsigned long long)(*g_set_hits_by)[1],
+            (unsigned long long)(*g_set_misses_by)[1], (unsigned long long)(*g_set_hits_by)[2], (unsigned long long)(*g_set_misses_by)[2],
+            (unsigned long long)(*g_set_hits_by)[3], (unsigned long long)(*g_set_misses_by)[3]);
+    for (int k = 0; k < 4; k++) (*g_set_hits_by)[k] = (*g_set_misses_by)[k] = 0;
+    (*g_handle_hits) = (*g_handle_misses) = (*g_sets_skipped) = (*g_set_hits) = (*g_set_misses) = 0;
 }
 
 }  // namespace nx::nvn::replay

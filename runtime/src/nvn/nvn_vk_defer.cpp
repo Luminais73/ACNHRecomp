@@ -6,6 +6,7 @@
 // replay goes on to the next draw. Calls that end, submit or reset command buffers, wait for the device or destroy
 // objects first wait for the ring to empty (vk_defer_drain), so Vulkan sees the same calls in the same order from one
 // thread at a time. A call whose structures this file cannot copy (a pNext chain) drains and runs in place.
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -28,11 +29,24 @@ void cpu_profile_register(const char* name);  // cpu_profile.cpp
 
 namespace nx::nvn {
 
+std::mutex& vk_queue_mutex();  // nvn_vk.cpp
+
 using namespace nx::vk;
 
 namespace {
 
-constexpr uint64_t kRingBytes = 64ull << 20;
+// Small enough to stay in the CPU's caches (the SoC's 4 MB L3 on a Snapdragon 865): with 64 MB every call's bytes
+// were written to and read back from DRAM, and the copies cost the replay as much as the Vulkan calls they replaced.
+// The replay waits when it is a whole ring ahead. NX_VK_DEFER_RING_KB overrides.
+uint64_t ring_bytes() {
+    static const uint64_t n = [] {
+        const char* e = std::getenv("NX_VK_DEFER_RING_KB");
+        uint64_t kb = e ? std::strtoull(e, nullptr, 10) : 1024;
+        return std::max<uint64_t>(kb, 256) << 10;
+    }();
+    return n;
+}
+#define kRingBytes ring_bytes()
 uint8_t* g_ring = nullptr;
 std::atomic<uint64_t> g_head{0}, g_tail{0};  // bytes written by the replay thread / executed by the recorder
 std::atomic<bool> g_sleeping{false};
@@ -280,16 +294,63 @@ VKAPI_ATTR void VKAPI_CALL W_CmdBindVertexBuffers(VkCommandBuffer cb, uint32_t f
     publish();
 }
 
-// Calls that end, submit or reset command buffers, wait, or destroy what earlier calls may use: the ring first.
+// The parts of a submit (nvn_frames.cpp: one every NX_SUBMIT_CHUNK_DRAWS draws) are begun, ended and queued in the
+// ring too, in order with the calls recorded into them: draining there made the replay wait for the recorder every
+// 150 draws, so the two threads took turns instead of overlapping. The results are taken to be VK_SUCCESS (a failed
+// call is logged by the recorder). The recorder takes the queue's lock for the submit, as the replay did.
+std::atomic<uint64_t> g_async_failures{0};
+VKAPI_ATTR VkResult VKAPI_CALL W_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo* i) {
+    if (!deferring() || i->pNext || i->pInheritanceInfo) {
+        if (t_defer) vk_defer_drain();
+        return R.BeginCommandBuffer(cb, i);
+    }
+    struct A { VkCommandBuffer cb; VkCommandBufferBeginInfo i; };
+    Writer w{reserve([](const uint8_t* p) {
+        const A& a = *reinterpret_cast<const A*>(p);
+        if (R.BeginCommandBuffer(a.cb, &a.i) != VK_SUCCESS) g_async_failures++;
+    }, bytes_of<A>())};
+    w.put(A{cb, *i});
+    publish();
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL W_EndCommandBuffer(VkCommandBuffer cb) {
+    if (!deferring()) return R.EndCommandBuffer(cb);
+    enqueue(+[](VkCommandBuffer c) {
+        if (R.EndCommandBuffer(c) != VK_SUCCESS) g_async_failures++;
+    }, cb);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL W_QueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
+    bool simple = deferring() && n == 1 && !s->pNext;
+    if (!simple) {
+        if (t_defer) vk_defer_drain();
+        return R.QueueSubmit(q, n, s, f);
+    }
+    struct A { VkQueue q; VkFence f; VkSubmitInfo si; };
+    Writer w{reserve([](const uint8_t* p) {
+        const A& a = *reinterpret_cast<const A*>(p);
+        std::lock_guard lk(vk_queue_mutex());
+        if (R.QueueSubmit(a.q, 1, &a.si, a.f) != VK_SUCCESS) g_async_failures++;
+    }, bytes_of<A>() + bytes_of<VkCommandBuffer>(s->commandBufferCount) +
+                     2 * bytes_of<VkSemaphore>(s->waitSemaphoreCount) + bytes_of<VkSemaphore>(s->signalSemaphoreCount))};
+    A* a = w.put(A{q, f, *s});
+    a->si.pCommandBuffers = w.array(s->pCommandBuffers, s->commandBufferCount);
+    a->si.pWaitSemaphores = w.array(s->pWaitSemaphores, s->waitSemaphoreCount);
+    a->si.pWaitDstStageMask = w.array(s->pWaitDstStageMask, s->waitSemaphoreCount);
+    a->si.pSignalSemaphores = w.array(s->pSignalSemaphores, s->signalSemaphoreCount);
+    publish();
+    return VK_SUCCESS;
+}
+
+// Calls that reset command buffers, wait, or destroy what earlier calls may use: the ring first.
 #define SYNC(ret, name, PARAMS, ARGS)                                   \
     VKAPI_ATTR ret VKAPI_CALL W_##name PARAMS {                         \
         if (t_defer) vk_defer_drain();                                  \
         return R.name ARGS;                                             \
     }
-SYNC(VkResult, BeginCommandBuffer, (VkCommandBuffer cb, const VkCommandBufferBeginInfo* i), (cb, i))
-SYNC(VkResult, EndCommandBuffer, (VkCommandBuffer cb), (cb))
 SYNC(VkResult, ResetCommandBuffer, (VkCommandBuffer cb, VkCommandBufferResetFlags f), (cb, f))
-SYNC(VkResult, QueueSubmit, (VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f), (q, n, s, f))
 SYNC(VkResult, QueueWaitIdle, (VkQueue q), (q))
 SYNC(VkResult, DeviceWaitIdle, (VkDevice d), (d))
 SYNC(VkResult, QueuePresentKHR, (VkQueue q, const VkPresentInfoKHR* i), (q, i))
@@ -557,6 +618,8 @@ void vk_defer_drain() {
         }
 }
 
+bool vk_defer_active() { return deferring(); }
+
 VkDeferScope::VkDeferScope() : on_(g_ring != nullptr) {
     if (on_) t_defer = true;
 }
@@ -566,8 +629,9 @@ VkDeferScope::~VkDeferScope() {
     t_defer = false;
     static uint64_t scopes = 0;
     if (++scopes % 600 == 0) {
-        log("nvn/vk: deferred Vulkan calls: %.0f per submit, %llu run in place, %.1f drains per submit",
-            double(g_deferred_calls) / 600.0, (unsigned long long)g_fallbacks, double(g_drains) / 600.0);
+        log("nvn/vk: deferred Vulkan calls: %.0f per submit, %llu run in place, %.1f drains per submit, %llu failed",
+            double(g_deferred_calls) / 600.0, (unsigned long long)g_fallbacks, double(g_drains) / 600.0,
+            (unsigned long long)g_async_failures.load());
         g_deferred_calls = g_fallbacks = g_drains = 0;
     }
 }

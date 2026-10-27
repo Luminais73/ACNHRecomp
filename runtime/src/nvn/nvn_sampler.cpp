@@ -49,7 +49,13 @@ VkSampler sampler_for(const SamplerInfo& s, bool shadow) {
     Key key;
     std::memcpy(key.b, &s, sizeof s);
     key.b[sizeof s] = shadow ? '1' : '0';
+    static PerThread<std::unordered_map<Key, VkSampler, ByteKeyHash>*> front_pt;  // the thread's own hits
+    auto& front = *front_pt;
+    if (!front) front = new std::unordered_map<Key, VkSampler, ByteKeyHash>();
+    if (auto f = front->find(key); f != front->end()) return f->second;
+    std::lock_guard lk(cache_mutex());  // shared with the parallel replay workers (nvn_pipeline.cpp)
     auto& v = cache[key];
+    if (v) return (*front)[key] = v;
     if (v) return v;
     VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     // NVN min filter: 0 nearest, 1 linear, 2 nearest mip nearest, 3 linear mip nearest, 4 nearest mip linear,

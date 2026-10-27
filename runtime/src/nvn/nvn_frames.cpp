@@ -53,7 +53,8 @@ std::recursive_mutex& gpu_lock();  // nvn_vk.cpp
 namespace {
 
 constexpr uint32_t kMaxSlots = 8;
-constexpr uint32_t kMaxParts = 64;  // command buffers per submit: chunks, the split, the last part
+constexpr uint32_t kMaxParts = 64;
+constexpr int kMaxWorkers = 4;  // parallel replay threads, the replay thread included (nvn_parallel.cpp)  // command buffers per submit: chunks, the split, the last part
 constexpr uint64_t kFenceTimeout = 2'000'000'000ull;  // a frame's work takes milliseconds; longer is a hung shader
 
 struct Slot {
@@ -77,9 +78,26 @@ struct Slot {
     bool replay = false;  // a submit's replay (not a present)
     uint64_t binds_at_split = 0;  // replay::written_bind_count() at the split
     uint64_t begin_ns = 0;
+    // The parallel replay's workers (docs/PARALLEL_REPLAY.md): a command pool and a descriptor pool each (both are
+    // externally synchronized), their command buffers queued between this slot's parts, under the last part's fence.
+    VkCommandPool wpool[kMaxWorkers] = {};
+    std::vector<VkCommandBuffer> wcbs[kMaxWorkers];
+    uint32_t wused[kMaxWorkers] = {};
+    VkDescriptorPool wdesc[kMaxWorkers] = {};
+    bool wdesc_used[kMaxWorkers] = {};
 };
 
 Slot g_slots[kMaxSlots];
+uint32_t g_family = 0;  // the queue family, for the workers' command pools
+
+// After the slot's submits completed: its workers' command buffers and sets are free again.
+void reset_worker_pools(Slot& s) {
+    for (int w = 0; w < kMaxWorkers; w++) {
+        if (s.wused[w]) p_vkResetCommandPool(vk_device(), s.wpool[w], 0);
+        if (s.wdesc_used[w]) p_vkResetDescriptorPool(vk_device(), s.wdesc[w], 0);
+        s.wused[w] = 0, s.wdesc_used[w] = false;
+    }
+}
 uint32_t g_slot_count = 0, g_next = 0;
 Slot* g_current = nullptr;               // the slot being recorded
 VkSemaphore g_rendered[kMaxSlots] = {};  // per swapchain image: signaled for its present
@@ -175,6 +193,7 @@ bool write_back_late() {
 }
 
 void late_bounds() {
+    (*replay::g_upload_epoch)++;
     g_late_lo = g_late_hi = nullptr;
     for (const LateRange& r : g_late) {
         if (!g_late_lo || r.p < g_late_lo) g_late_lo = r.p;
@@ -231,6 +250,7 @@ bool retire_oldest() {
             if (g_slot_pools && s->pool_used) p_vkResetCommandPool(vk_device(), s->pool, 0);
             if (s->descriptors_used) p_vkResetDescriptorPool(vk_device(), s->descriptors, 0);
             s->pool_used = s->descriptors_used = false;
+            reset_worker_pools(*s);
             s->sets_used = 0, std::fill(std::begin(s->descs_used), std::end(s->descs_used), 0u);
             s->reset_done.store(true, std::memory_order_release);
         });
@@ -238,6 +258,7 @@ bool retire_oldest() {
         if (s->descriptors_used) p_vkResetDescriptorPool(vk_device(), s->descriptors, 0);
         s->descriptors_used = false;
         s->sets_used = 0, std::fill(std::begin(s->descs_used), std::end(s->descs_used), 0u);
+        reset_worker_pools(*s);
     }
     g_tail = std::max(g_tail, s->ring_end);
     g_completed = s->serial;
@@ -261,8 +282,9 @@ void write_back_before_read(const uint8_t* p, uint64_t size, const char* why) {
     for (const LateRange& r : g_late)
         if (p < r.p + r.size && r.p < p + size) serial = std::max(serial, r.serial);
     if (!serial) return;
-    g_late_reads++;
     if (g_completed >= serial) return;
+    if (worker_bail("late write-back")) return;  // waiting for a submit is the replay thread's (docs/PARALLEL_REPLAY.md)
+    g_late_reads++;
     g_late_waits++;
     static int traced = 0;
     if (traced++ < 4)
@@ -379,7 +401,9 @@ bool submit_part(VkCommandBuffer cb, VkFence fence, VkSemaphore wait, VkSemaphor
     }
     p_vkResetFences(vk_device(), 1, &fence);
     VkResult r;
-    {
+    if (vk_defer_active()) {  // queued in the recorder's ring, which takes the lock itself (holding it here could
+        r = p_vkQueueSubmit(vk_queue(), 1, &si, fence);  // deadlock with a full ring)
+    } else {
         std::lock_guard q(vk_queue_mutex());
         r = p_vkQueueSubmit(vk_queue(), 1, &si, fence);
     }
@@ -463,6 +487,7 @@ void frame_init(VkCommandPool pool, uint32_t family, VkBuffer ring, uint8_t* rin
     g_slot_count = std::min(kMaxSlots, frames * 2);
     VkDevice d = vk_device();
     g_slot_pools = std::getenv("NX_CB_RESET") == nullptr;
+    g_family = family;
     for (uint32_t k = 0; k < g_slot_count; k++) {
         if (g_slot_pools) {
             VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -565,6 +590,51 @@ VkCommandBuffer frame_chunk(VkCommandBuffer cb, uint64_t draws, bool pass_open) 
     uint64_t since = draws - g_chunk_from;
     if (since < g_chunk_draws || (pass_open && since < 2 * g_chunk_draws)) return cb;
     g_stats.chunks++;
+    return next_part(*s);
+}
+
+// ---- the parallel replay's command buffers (nvn_parallel.cpp) ----------------------------------------------------
+
+void* frame_current_slot() { return g_current; }
+
+// On a worker: a command buffer of its own for the slot, begun as a part is (after a full barrier).
+VkCommandBuffer frame_worker_begin(void* slot, int w) {
+    Slot& s = *static_cast<Slot*>(slot);
+    if (!s.wpool[w]) {
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.queueFamilyIndex = g_family;
+        if (p_vkCreateCommandPool(vk_device(), &pci, nullptr, &s.wpool[w]) != VK_SUCCESS) return VK_NULL_HANDLE;
+    }
+    if (s.wused[w] == s.wcbs[w].size()) {
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = s.wpool[w];
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        if (p_vkAllocateCommandBuffers(vk_device(), &cai, &cb) != VK_SUCCESS) return VK_NULL_HANDLE;
+        s.wcbs[w].push_back(cb);
+    }
+    VkCommandBuffer cb = s.wcbs[w][s.wused[w]++];
+    return begin_part(cb) ? cb : VK_NULL_HANDLE;
+}
+
+void frame_worker_end(VkCommandBuffer cb) { p_vkEndCommandBuffer(cb); }
+
+// On the replay thread, in order: a worker's command buffer queued after what was queued so far (no fence: the
+// submit's last part's fence covers it, as everything earlier in submission order).
+bool frame_queue_worker_cbs(const VkCommandBuffer* cbs, uint32_t n) {
+    if (!n) return true;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = n;  // one submit for a region's buffers: each vkQueueSubmit is a kernel call
+    si.pCommandBuffers = cbs;
+    std::lock_guard q(vk_queue_mutex());
+    return p_vkQueueSubmit(vk_queue(), 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
+}
+
+// The replay thread's part ends here and is queued; the next begins (what follows the workers' buffers).
+VkCommandBuffer frame_cut(VkCommandBuffer cb) {
+    Slot* s = g_current;
+    if (!s || cb != s->cbs[s->part] || s->part + 2 >= kMaxParts) return frame_cb(cb);
     return next_part(*s);
 }
 
@@ -687,9 +757,43 @@ void frame_log(uint64_t frames) {
     g_stats = {};
 }
 
+Upload upload_locked(uint64_t size, uint64_t align);
+
+// A parallel replay worker takes the ring in chunks (a lock per chunk, not per upload).
 Upload frame_upload_alloc(uint64_t size, uint64_t align) {
+    if (!*t_parallel_worker) return upload_locked(size, align);
+    struct Chunk {
+        uint64_t begin = UINT64_MAX, off = 0, end = 0;
+        uint8_t* base = nullptr;
+        VkBuffer buffer = VK_NULL_HANDLE;
+    };
+    static PerThread<Chunk> chunk_pt;
+    Chunk& c = *chunk_pt;
+    uint64_t o = (c.off + align - 1) & ~(align - 1);
+    if (c.begin != g_begin || o + size > c.end) {
+        const uint64_t want = std::max<uint64_t>(256 << 10, size + align);
+        Upload u = upload_locked(want, 256);
+        if (*t_bail) return u;  // the ring is full: scratch (the chunk is replayed by the replay thread)
+        c = {g_begin, u.offset, u.offset + want, u.ptr - u.offset, u.buffer};
+        o = (c.off + align - 1) & ~(align - 1);
+    }
+    c.off = o + size;
+    return {c.buffer, o, c.base + o};
+}
+
+Upload upload_locked(uint64_t size, uint64_t align) {
+    // The parallel replay's workers allocate here too (docs/PARALLEL_REPLAY.md); a full ring is only waited for by the
+    // replay thread: a worker gets scratch memory (its chunk is replayed again by the replay thread).
+    static std::mutex mx;
+    std::lock_guard lk(mx);
     uint64_t at = (g_head + align - 1) & ~(align - 1);
     if (at % g_ring_size + size > g_ring_size) at += g_ring_size - at % g_ring_size;  // never split: the next lap
+    if (at + size > g_tail + g_ring_size && worker_bail("upload ring full")) {
+        static PerThread<std::vector<uint8_t>> scratch_pt;
+        auto& scratch = *scratch_pt;
+        if (scratch.size() < size) scratch.resize(size);
+        return {g_ring, 0, scratch.data()};
+    }
     while (at + size > g_tail + g_ring_size)  // the oldest submits' data is still read: wait for them
         if (!retire_oldest()) {
             // The submit's parts queued so far may still read its data: wait for them first.
@@ -709,6 +813,23 @@ Upload frame_upload_alloc(uint64_t size, uint64_t align) {
 }
 
 VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout) {
+    if ((*t_parallel_worker)) {  // the worker's own pool of the slot it records for
+        Slot* ws = static_cast<Slot*>((*t_worker_slot));
+        if (!ws) return VK_NULL_HANDLE;
+        VkDescriptorPool& pool = ws->wdesc[(*t_worker_index)];
+        if (!pool) pool = make_descriptor_pool();
+        ws->wdesc_used[(*t_worker_index)] = true;
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &layout;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (p_vkAllocateDescriptorSets(vk_device(), &ai, &set) != VK_SUCCESS) {
+            log("nvn/vk: a parallel replay worker's descriptor pool is exhausted");
+            worker_bail("descriptor pool");
+        }
+        return set;
+    }
     if (!g_current) return VK_NULL_HANDLE;
     Slot& s = *g_current;
     if (!s.descriptors) s.descriptors = make_descriptor_pool();

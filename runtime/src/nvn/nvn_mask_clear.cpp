@@ -147,6 +147,7 @@ VkShaderModule vertex_module() {
 VkShaderModule fragment_module(uint32_t slot) {
     static VkShaderModule modules[8] = {};
     if (slot >= 8) return VK_NULL_HANDLE;
+    std::lock_guard lk(cache_mutex());  // the parallel replay's workers too (docs/PARALLEL_REPLAY.md)
     if (!modules[slot]) {
         std::vector<uint32_t> code(kFragment, kFragment + sizeof kFragment / 4);
         // OpDecorate (word count 4, opcode 71) <id> Location (30) <literal>: the only one in this module.
@@ -179,6 +180,7 @@ struct Key {
 VkPipeline pipeline(const Key& key) {
     static std::map<std::string, VkPipeline> cache;
     std::string k(reinterpret_cast<const char*>(&key), sizeof key);
+    std::lock_guard lk(cache_mutex());
     auto it = cache.find(k);
     if (it != cache.end()) return it->second;
     VkPipelineShaderStageCreateInfo stages[2]{};

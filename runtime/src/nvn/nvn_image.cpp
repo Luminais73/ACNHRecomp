@@ -95,6 +95,10 @@ bool keep_targets() {
 GpuImage* image_of(uint64_t guest) {
     Texture* t = get<Texture>(guest);
     if (!t) return nullptr;
+    if ((*t_parallel_worker)) {  // only an image already made: a new one is the replay thread's (docs/PARALLEL_REPLAY.md)
+        if ((t->uw && t->uw_gen != uw_generation()) || !t->image) return worker_bail("image to make"), nullptr;
+        return t->image.get();
+    }
     if (t->uw && t->uw_gen != uw_generation()) {  // a new screen scale (nvn_ultrawide.cpp): a new image of the new size
         static uint32_t purged = 0;
         if (purged != uw_generation()) {  // the kept images of the old size go once no submit uses them

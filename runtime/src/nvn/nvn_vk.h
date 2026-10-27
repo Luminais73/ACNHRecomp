@@ -2,11 +2,31 @@
 // resources, draws). Everything here runs under the GPU lock taken by gpu_submit / gpu_present.
 #pragma once
 
+#include <atomic>
+#include "nvn_per_thread.h"
+
+#include <unordered_set>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "nvn.h"
 #include "vk_gen.h"
+
+namespace nx::nvn {
+// A cache array of each replaying thread (the replay thread's and the parallel replay workers', docs/PARALLEL_REPLAY.md),
+// allocated on its first use: as a plain NX_REPLAY_LOCAL it would be in every thread's TLS block (~90 threads).
+template <typename T, size_t N>
+struct TlsArray {
+    T* p = nullptr;
+    T& operator[](size_t i) {
+        if (!p) [[unlikely]] p = new T[N]();
+        return p[i];
+    }
+    T* begin() { return &(*this)[0]; }
+    T* end() { return &(*this)[0] + N; }
+};
+}  // namespace nx::nvn
 
 namespace nx::nvn {
 
@@ -254,7 +274,9 @@ bool mask_clear(VkCommandBuffer cb, const Targets& t, uint32_t slot, uint32_t ma
                 const VkRect2D& rect);
 // nvn_replay.cpp: a command list into `cb` (`depth`: CallList nesting).
 void replay_list(VkCommandBuffer cb, Targets& st, const CmdList& list, int depth);
-CmdList* submit_command_list(uint64_t handle);  // command_list(), once per handle per submit (kept alive by it)
+CmdList* submit_command_list(uint64_t handle);
+bool parallel_plan_on();  // nvn_parallel.cpp (docs/PARALLEL_REPLAY.md)
+void parallel_plan_frame(const std::vector<std::shared_ptr<CmdList>>& lists);  // command_list(), once per handle per submit (kept alive by it)
 void submit_lists_reset();  // at each submit's start (draw_begin_submit)
 
 void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list);  // nvn_copy.cpp: texture copies
@@ -291,6 +313,7 @@ void gpu_busy_log(uint64_t frames);
 // waits until the recorder ran everything queued.
 void vk_defer_install();
 void vk_defer_drain();
+bool vk_defer_active();  // this thread's Vulkan calls go to the recorder now
 class VkDeferScope {
 public:
     VkDeferScope();
@@ -307,8 +330,41 @@ void gpu_profile_mark(VkCommandBuffer cb, const std::string& label);
 void gpu_profile_collect();
 void gpu_profile_log(uint64_t frames);
 
+// Parallel replay (docs/PARALLEL_REPLAY.md, nvn_parallel.cpp): set on a worker thread while it replays a chunk. A worker
+// never creates an image or changes one's state (layout, rendered, uploads): where the replay would, worker_bail()
+// marks the chunk, the worker stops, and the replay thread replays the chunk itself in order.
+extern PerThread<bool> t_parallel_worker;
+extern PerThread<bool> t_bail;
+extern PerThread<void*> t_worker_slot;  // the frame slot the worker records for (nvn_frames.cpp)
+extern PerThread<int> t_worker_index;
+void* frame_current_slot();
+VkCommandBuffer frame_worker_begin(void* slot, int worker);  // on the worker
+void frame_worker_end(VkCommandBuffer cb);
+bool frame_queue_worker_cbs(const VkCommandBuffer* cbs, uint32_t n);  // on the replay thread, in order
+VkCommandBuffer frame_cut(VkCommandBuffer cb);   // the replay thread's part queued, the next begun
+void draw_begin_worker(bool fresh);  // nvn_draw.cpp: a worker's own draw state for a chunk
+// nvn_replay.cpp: one command as replay_list replays it (not CallList); cb may change (the submit's parts).
+void replay_cmd(VkCommandBuffer& cb, Targets& st, const Cmd& c, const CmdList& list);
+bool parallel_replay_on();  // nvn_parallel.cpp
+void parallel_replay(VkCommandBuffer& cb, Targets& st, const std::vector<std::shared_ptr<CmdList>>& lists,
+                     size_t split_after);
+inline std::atomic<const char*> g_bail_reason{nullptr};  // the latest worker_bail's, for the log
+inline bool worker_bail(const char* why = "other") {
+    if (!*t_parallel_worker) return false;
+    *t_bail = true;
+    g_bail_reason.store(why, std::memory_order_relaxed);
+    return true;
+}
+// nvn_clears.cpp: a worker's clear-on-bind decisions (the clears to skip), taken by the replay thread's plan.
+extern PerThread<const std::unordered_set<const Cmd*>*> t_clear_once_skip;
+bool clear_once_plan(const Targets& t, const Cmd& c);
+std::recursive_mutex& cache_mutex();  // nvn_pipeline.cpp: views, layouts, samplers, pipelines
+
 namespace replay {
 void dedup_reset();  // nvn_dedup.cpp
+// Bumped whenever what an upload of guest bytes would give may change: dedup reset or invalidated, compute-written
+// ranges or late write-backs added or dropped (nvn_dedup.cpp, nvn_written.cpp, nvn_frames.cpp). The replay thread's.
+extern PerThread<uint64_t> g_upload_epoch;
 bool written_separate();         // nvn_written.cpp (nvn_draw_state.h)
 uint64_t written_bind_count();   // nvn_written.cpp: written_bind calls so far (a dispatch bound storage it writes)
 void trace_nan_write_back(const uint8_t* from, const uint8_t* to, uint64_t size);  // nvn_draw_trace.cpp

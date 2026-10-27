@@ -10,6 +10,8 @@
 // its shape in the middle. Both may change while the game runs: the targets are made again at a new generation.
 #pragma once
 
+#include "nvn_per_thread.h"
+
 #include <cstdint>
 #include <vector>
 
@@ -44,7 +46,7 @@ struct UwTarget {
     float ay() const { return sx < sy ? sx / sy : 1.0f; }
     float s() const { return sx < sy ? sx : sy; }           // the resolution part (Ryujinx's render scale)
 };
-extern UwTarget g_uw;
+extern PerThread<UwTarget> g_uw;  // per replaying thread
 // A guest viewport/scissor span on a scaled target: offset and size times `f`, kept inside `extent`.
 void uw_span(int32_t& x, int32_t& w, uint32_t extent, float f);
 void uw_cameras(uint64_t present);     // camera aspect patch (called at each present)

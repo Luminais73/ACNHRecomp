@@ -813,6 +813,24 @@ static std::vector<std::string> external_files_dirs(android_app* app) {
     return out;  // the thread stays attached, as for the other calls here
 }
 
+#ifdef NX_PGO_GENERATE
+// An instrumented build (NX_PGO=generate, CMakeLists.txt): the counters go to <data folder>/acnh.profraw after
+// NX_PGO_SECONDS (240) of play, and again every minute after (the app is never exited normally).
+extern "C" void __llvm_profile_set_filename(const char*);
+extern "C" int __llvm_profile_write_file(void);
+static void pgo_writer(void*) {
+    const char* e = std::getenv("NX_PGO_SECONDS");
+    nx::plat::sleep_ns(int64_t(e ? std::atoi(e) : 240) * 1'000'000'000);
+    static std::string path = nx::plat::data_root() + "/acnh.profraw";
+    for (;;) {
+        __llvm_profile_set_filename(path.c_str());
+        int r = __llvm_profile_write_file();
+        nx::log("pgo: profile written to %s (%d)", path.c_str(), r);
+        nx::plat::sleep_ns(60'000'000'000);
+    }
+}
+#endif
+
 extern "C" void android_main(android_app* app) {
     using namespace nx::plat;
     g_app = app;
@@ -921,6 +939,9 @@ extern "C" void android_main(android_app* app) {
         }
         if (!started && g_window) {
             started = true;
+#ifdef NX_PGO_GENERATE
+            start_thread(pgo_writer, nullptr, 1 << 20);
+#endif
             start_thread(game_thread, nullptr, 256ull << 20);  // the guest main thread; deep host recursion
         }
         if (started) sleep_ns(2'000'000);

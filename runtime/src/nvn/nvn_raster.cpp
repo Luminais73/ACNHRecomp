@@ -88,7 +88,7 @@ bool equal_slack_pass(const DepthStencilInfo& d) {
 namespace replay {
 
 bool raster_command(const Cmd& c) {
-    State& s = g_state;
+    State& s = (*g_state);
     switch (c.op) {
         case Cmd::SetStencilRef:
         case Cmd::SetStencilMask:
@@ -119,7 +119,7 @@ bool raster_command(const Cmd& c) {
 
 // Before each draw (every pipeline declares these dynamic, nvn_pipeline.cpp, so they must all be set).
 void raster_dynamic(VkCommandBuffer cb, bool slack) {
-    const State& s = g_state;
+    const State& s = (*g_state);
     auto set = [&](PFN_vkCmdSetStencilReference fn, const uint8_t* v) {  // the three setters share the signature
         if (v[0] == v[1]) {
             fn(cb, VK_STENCIL_FACE_FRONT_AND_BACK, v[0]);

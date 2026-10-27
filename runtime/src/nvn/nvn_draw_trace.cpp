@@ -40,7 +40,7 @@ LiveDebug& live_debug() {
             std::fclose(f);
             std::remove((root + "/trace_draws").c_str());
             d.trace_left = n;
-            log("trace_draws: the next %llu draws (from draw %llu, frame %llu)", n, (unsigned long long)g_stats.done,
+            log("trace_draws: the next %llu draws (from draw %llu, frame %llu)", n, (unsigned long long)(*g_stats).done,
                 (unsigned long long)frame);
         }
         std::string skip;
@@ -92,11 +92,11 @@ void trace_cube_draw(const Targets& t, const ShaderInfo* vs, const ShaderInfo* f
     }
     GpuImage* d = t.depth ? image_of(t.depth) : nullptr;
     log("cube draw %llu frame %llu: vs %s fs %s targets %u:%llx level %u layer %u depth %llx (%ux%u)%s",
-        (unsigned long long)g_stats.done, (unsigned long long)g_frame.load(), vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
+        (unsigned long long)(*g_stats).done, (unsigned long long)g_frame.load(), vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
         t.color_count, (unsigned long long)t.colors[0], t.views.level[0], t.views.layer[0], (unsigned long long)t.depth,
         d ? d->width : 0, d ? d->height : 0, tex.c_str());
     for (int bank : {4, 5}) {  // the probe shaders' axes (c4[1..3]), colours (c5[16..21]) and LUT rows (c5[8..10])
-        const Range& u = g_state.uniforms[1][bank - 3];
+        const Range& u = (*g_state).uniforms[1][bank - 3];
         const float* f = u.address ? reinterpret_cast<const float*>(guest_bytes(u.address)) : nullptr;
         std::string rows;
         for (int r : {0, 1, 2, 3, 8, 16, 17, 18, 19})
@@ -107,7 +107,7 @@ void trace_cube_draw(const Targets& t, const ShaderInfo* vs, const ShaderInfo* f
             }
         log("  fs c%d (%llx, %llu bytes):%s", bank, (unsigned long long)u.address, (unsigned long long)u.size, rows.c_str());
     }
-    if (const Range& u = g_state.uniforms[1][0]; u.address && u.size >= 64)  // fs c3: lod, level, probe index
+    if (const Range& u = (*g_state).uniforms[1][0]; u.address && u.size >= 64)  // fs c3: lod, level, probe index
         if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
             log("  fs c3: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", f[0], f[1], f[2], f[3], f[4], f[5],
                 f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
@@ -132,16 +132,16 @@ void trace_nan_dispatch(const ShaderInfo* cs) {
     if (c8 && dispatches++ < 0) {
         std::string r;
         for (int k = 0; k < 16; k++)
-            if (g_state.storage[5][k].address) {
+            if ((*g_state).storage[5][k].address) {
                 char b[64];
-                std::snprintf(b, sizeof b, " s%d=%llx+%llu", k, (unsigned long long)g_state.storage[5][k].address,
-                              (unsigned long long)g_state.storage[5][k].size);
+                std::snprintf(b, sizeof b, " s%d=%llx+%llu", k, (unsigned long long)(*g_state).storage[5][k].address,
+                              (unsigned long long)(*g_state).storage[5][k].size);
                 r += b;
             }
         log("dispatch %d: cs %s%s", dispatches, cs->hash.c_str(), r.c_str());
     }
     if (!trace_nan_on()) return;
-    for (const Range& r : g_state.storage[5])
+    for (const Range& r : (*g_state).storage[5])
         if (r.address) g_nan_writers[reinterpret_cast<uintptr_t>(guest_bytes(r.address))] = cs->hash;
 }
 
@@ -171,10 +171,10 @@ void trace_pass(const char* what, const Targets& t, uint32_t a, uint32_t b) {
     static const char* env = std::getenv("NX_TRACE_PASSES");
     static const uint64_t from = env ? std::strtoull(env, nullptr, 10) : 0;
     static int n = 0;
-    if (!env || g_stats.done < from || n++ >= 4000) return;
+    if (!env || (*g_stats).done < from || n++ >= 4000) return;
     Texture* c0 = t.color_count && t.colors[0] ? get<Texture>(t.colors[0]) : nullptr;
     log("pass: %s %x %x after draw %llu: %u colours, 0 = %llx (%ux%u f%x L%u l%u view f%x) depth %llx", what, a, b,
-        (unsigned long long)g_stats.done, t.color_count, (unsigned long long)t.colors[0], c0 ? c0->width : 0,
+        (unsigned long long)(*g_stats).done, t.color_count, (unsigned long long)t.colors[0], c0 ? c0->width : 0,
         c0 ? c0->height : 0, c0 ? c0->format : 0, t.views.level[0], t.views.layer[0], t.views.format[0],
         (unsigned long long)t.depth);
 }
@@ -191,7 +191,7 @@ bool snap_follow(const Targets& t, const ShaderInfo* vs, const ShaderInfo* fs, c
     static const int count = std::getenv("NX_SNAP_FOLLOW_COUNT") ? std::atoi(std::getenv("NX_SNAP_FOLLOW_COUNT")) : 48;
     static const bool by_frame = env.find("@f") != std::string::npos;  // <hash>@f<presented frame>
     static const uint64_t frame_from = by_frame ? std::strtoull(env.c_str() + env.find("@f") + 2, nullptr, 10) : 0;
-    bool started = by_frame ? g_frame >= frame_from : g_stats.done >= from;
+    bool started = by_frame ? g_frame >= frame_from : (*g_stats).done >= from;
     if (!target && started && ((fs && env.compare(0, 16, fs->hash) == 0) || env.compare(0, 16, vs->hash) == 0))
         target = t.colors[0], left = count;  // the vertex shader's hash matches too
     if (!target || t.colors[0] != target || left <= 0) return false;
@@ -207,7 +207,7 @@ bool snap_follow(const Targets& t, const ShaderInfo* vs, const ShaderInfo* fs, c
                       tx ? tx->height : 0, tx ? tx->format : 0, tx && tx->image && tx->image->rendered ? " rt" : "");
         tex += b;
     }
-    log("follow: draw %llu vs %s fs %s%s", (unsigned long long)g_stats.done, vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
+    log("follow: draw %llu vs %s fs %s%s", (unsigned long long)(*g_stats).done, vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
         tex.c_str());
     static const bool nosnap = std::getenv("NX_SNAP_FOLLOW_NOSNAP") != nullptr;  // log only (8 MB per snapshot)
     return !nosnap;
@@ -265,7 +265,7 @@ void frame_sig_draw(const Targets& t, bool indexed, uint32_t count, uint32_t ins
             if (img && img->rendered && watch.find('+') != std::string::npos) s += explain_texture_slot(handles[k]);
         }
         for (int n = 0; n < 18; n++)
-            if (const Range& r = g_state.uniforms[4][n]; r.address && r.size)
+            if (const Range& r = (*g_state).uniforms[4][n]; r.address && r.size)
                 if (const uint8_t* p = guest_bytes(r.address)) {
                     char b[64];
                     std::snprintf(b, sizeof b, " c%d=%llx:%08x", n, (unsigned long long)r.address,
@@ -283,7 +283,7 @@ void frame_sig_draw(const Targets& t, bool indexed, uint32_t count, uint32_t ins
     // and its present (a block caught while the game rewrites it).
     for (int st : {0, 4})
         for (int n = 0; n < 18; n++)
-            if (const Range& r = g_state.uniforms[st][n]; r.address && r.size >= 16 && !g_sig.blocks.count(r.address))
+            if (const Range& r = (*g_state).uniforms[st][n]; r.address && r.size >= 16 && !g_sig.blocks.count(r.address))
                 if (const uint8_t* p = guest_bytes(r.address)) {
                     uint64_t size = std::min<uint64_t>(r.size, 4096), z = 0;
                     char b[96];
@@ -296,7 +296,7 @@ void frame_sig_draw(const Targets& t, bool indexed, uint32_t count, uint32_t ins
     if (indexed || count > 6 || instances != 1 || g_sig.passes.size() > 2000) return;
     uint32_t u = 2166136261u;
     for (int n = 0; n < 18; n++)
-        if (const Range& r = g_state.uniforms[4][n]; r.address && r.size)
+        if (const Range& r = (*g_state).uniforms[4][n]; r.address && r.size)
             if (const uint8_t* p = guest_bytes(r.address)) u = fnv(u, p, std::min<uint64_t>(r.size, 4096));
     char b[64];
     std::snprintf(b, sizeof b, " %.6s>%llx:%08x", fs ? fs->hash.c_str() : "-",
@@ -348,7 +348,7 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
     static int big = 0;
     uint32_t count = uint32_t(indexed ? c.i[0] : c.i[1]), instances = uint32_t(std::max(1, c.i[3]));
     if ((count > (1u << 18) || instances > 1024 || uint64_t(count) * instances > (1u << 20)) && big++ < 40)
-        log("nvn: huge draw %llu: vs %s fs %s %s count %u x%u", (unsigned long long)g_stats.done, vs->hash.c_str(),
+        log("nvn: huge draw %llu: vs %s fs %s %s count %u x%u", (unsigned long long)(*g_stats).done, vs->hash.c_str(),
             fs ? fs->hash.c_str() : "-", indexed ? "indexed" : "arrays", count, instances);
     // The traces below, each behind an env check of its own, were ~3% of a draw's replay with none of them set.
     static const bool any = [] {
@@ -371,20 +371,20 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
     if (by_size && t.color_count && t.colors[0] && traced_size < 300)
         if (GpuImage* img = image_of(t.colors[0]); img && img->width == size_w && img->height == size_h &&
                                                    seen_size.insert(std::to_string(t.colors[0]) + vs->hash + (fs ? fs->hash : "") +
-                                                                    std::to_string(g_state.color.blend_enable[0])).second) {
+                                                                    std::to_string((*g_state).color.blend_enable[0])).second) {
             traced_size++;
             std::string tex;
             for (size_t k = 0; k < handles.size() && k < 6; k++) {
                 char b[48];
-                const uint64_t tx = k < g_textures.resolved.size() ? g_textures.resolved[k].texture : 0;
+                const uint64_t tx = k < (*g_textures).resolved.size() ? (*g_textures).resolved[k].texture : 0;
                 const GpuImage* ti = tx ? image_of(tx) : nullptr;
                 std::snprintf(b, sizeof b, " %ux%u/%d", ti ? ti->width : 0, ti ? ti->height : 0, ti ? int(ti->format) : 0);
                 tex += b;
             }
             log("size draw %llu (frame %llu): target %llx vs %s fs %s count %u x%u blend %d mask %x textures%s",
-                (unsigned long long)g_stats.done, (unsigned long long)g_frame.load(std::memory_order_relaxed),
+                (unsigned long long)(*g_stats).done, (unsigned long long)g_frame.load(std::memory_order_relaxed),
                 (unsigned long long)t.colors[0], vs->hash.c_str(), fs ? fs->hash.c_str() : "-", count, instances,
-                int(g_state.color.blend_enable[0]), unsigned(g_state.mask.mask[0]), tex.c_str());
+                int((*g_state).color.blend_enable[0]), unsigned((*g_state).mask.mask[0]), tex.c_str());
         }
     // NX_TRACE_3D=1: draws into a slice of a 3D texture (a colour-grading LUT), briefly (400 at most).
     static const bool trace_3d = std::getenv("NX_TRACE_3D") != nullptr;
@@ -396,7 +396,7 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
                 if (tt->memory && tt->target != 2 && tt->memory <= m && m < tt->memory + std::max<uint64_t>(tt->storage_size, 1)) {
                     traced_3d++;
                     log("3d alias draw %llu: 2D target %llx (%ux%u fmt %#x mem %llx +%llx) over a 3D texture's memory %llx, "
-                        "slice %u fs %s", (unsigned long long)g_stats.done, (unsigned long long)t.colors[0], tt->width,
+                        "slice %u fs %s", (unsigned long long)(*g_stats).done, (unsigned long long)t.colors[0], tt->width,
                         tt->height, tt->format, (unsigned long long)tt->memory, (unsigned long long)tt->storage_size,
                         (unsigned long long)m, t.views.layer[0], fs ? fs->hash.c_str() : "-");
                 }
@@ -404,7 +404,7 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
         if (GpuImage* img = image_of(t.colors[0]); img && img->view_type == VK_IMAGE_VIEW_TYPE_3D) {
             traced_3d++;
             log("3d draw %llu: target %llx (%ux%ux%u) slice %u level %u fs %s count %u x%u frame %llu",
-                (unsigned long long)g_stats.done, (unsigned long long)t.colors[0], img->width, img->height, img->depth,
+                (unsigned long long)(*g_stats).done, (unsigned long long)t.colors[0], img->width, img->height, img->depth,
                 t.views.layer[0], t.views.level[0], fs ? fs->hash.c_str() : "-", count, instances,
                 (unsigned long long)g_frame.load(std::memory_order_relaxed));
         }
@@ -422,16 +422,16 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
     // NX_TRACE_FRAME=<present>: only draws replayed once that many frames were presented.
     static const uint64_t trace_frame = std::getenv("NX_TRACE_FRAME") ? std::strtoull(std::getenv("NX_TRACE_FRAME"), nullptr, 10) : 0;
     LiveDebug& live = live_debug();
-    if ((trace_env && g_stats.done >= trace_from && traced < trace_count && (!trace_target || t.colors[0] == trace_target) &&
+    if ((trace_env && (*g_stats).done >= trace_from && traced < trace_count && (!trace_target || t.colors[0] == trace_target) &&
          g_frame.load(std::memory_order_relaxed) >= trace_frame &&
          (!fs_env || (fs && std::strstr(fs_env, fs->hash.c_str())))) ||  // one hash or a comma list
         (live.trace_left && live.trace_left--)) {
         traced++;
         // NX_TRACE_VERTS=1: the first 3 vertices of stream 0 as floats and halves (8 words each at most).
-        if (std::getenv("NX_TRACE_VERTS") && !g_state.streams.empty())
-            if (const Range& vb = g_state.vertex_buffers[0]; vb.address)
+        if (std::getenv("NX_TRACE_VERTS") && !(*g_state).streams.empty())
+            if (const Range& vb = (*g_state).vertex_buffers[0]; vb.address)
                 if (const auto* w = reinterpret_cast<const uint32_t*>(guest_bytes(vb.address))) {
-                    uint32_t stride = g_state.streams[0].stride, words = std::min<uint32_t>(stride / 4, 8);
+                    uint32_t stride = (*g_state).streams[0].stride, words = std::min<uint32_t>(stride / 4, 8);
                     for (uint32_t v = 0; v < 3 && uint64_t(v + 1) * stride <= vb.size; v++) {
                         std::string line;
                         for (uint32_t k = 0; k < words; k++) {
@@ -467,25 +467,25 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
             tex += b;
         }
         if (std::getenv("NX_TRACE_VS_BLOCKS"))
-            if (const Range& u = g_state.uniforms[0][0]; u.address)
+            if (const Range& u = (*g_state).uniforms[0][0]; u.address)
                 if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
                     for (int row = 0; row < std::min<int>(int(u.size / 16), 36); row++)
                         log("  vs c3[%d]: %g %g %g %g", row, f[4 * row], f[4 * row + 1], f[4 * row + 2], f[4 * row + 3]);
         for (int blk = 1; blk <= 3 && std::getenv("NX_TRACE_VS_BLOCKS"); blk++)
-            if (const Range& u = g_state.uniforms[0][blk]; u.address)
+            if (const Range& u = (*g_state).uniforms[0][blk]; u.address)
                 if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
                     log("  vs c%d: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", blk + 3, f[0], f[1], f[2], f[3],
                         f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
-        if (const Range& u = g_state.uniforms[0][0]; u.address)
+        if (const Range& u = (*g_state).uniforms[0][0]; u.address)
             if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
                 log("  vs c3 @%llx: %g %g %g %g | %g %g %g %g", (unsigned long long)u.address, f[0], f[1], f[2], f[3], f[4],
                     f[5], f[6], f[7]);
-        if (const Range& u = g_state.uniforms[1][0]; u.address)
+        if (const Range& u = (*g_state).uniforms[1][0]; u.address)
             if (auto* f = reinterpret_cast<const float*>(guest_bytes(u.address)))
                 for (uint64_t k = 0; k < std::min<uint64_t>(u.size / 16, 8); k++)
                     log("  fs c3[%llu] @%llx: %g %g %g %g", (unsigned long long)k, (unsigned long long)u.address,
                         f[4 * k], f[4 * k + 1], f[4 * k + 2], f[4 * k + 3]);
-        if (const Range& r = g_state.storage[0][0]; r.address && std::getenv("NX_TRACE_GLYPHS"))
+        if (const Range& r = (*g_state).storage[0][0]; r.address && std::getenv("NX_TRACE_GLYPHS"))
             if (auto* g = guest_bytes(r.address))
                 for (uint64_t k = 0; k < std::min<uint64_t>(r.size / 64, 3); k++) {
                     const uint32_t* w = reinterpret_cast<const uint32_t*>(g + 64 * k);
@@ -507,7 +507,7 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
                         w[12], w[13], w[14], w[15]);
                 }
         for (int k = 0; k < 2; k++)
-            if (const Range& r = g_state.storage[0][k]; r.address) {
+            if (const Range& r = (*g_state).storage[0][k]; r.address) {
                 auto* f = reinterpret_cast<const float*>(guest_bytes(r.address));
                 log("  vs s%d @%llx+%llx: %g %g %g %g %g %g %g %g", k, (unsigned long long)r.address,
                     (unsigned long long)r.size, f ? f[0] : -1, f ? f[1] : -1, f ? f[2] : -1, f ? f[3] : -1,
@@ -531,16 +531,16 @@ void trace_draw(const Targets& t, uint32_t mode, bool indexed, const Cmd& c, con
             log("  fs constants %zu bytes: %g %g %g %g", k.size(), k.size() >= 4 ? f[0] : -1, k.size() >= 8 ? f[1] : -1,
                 k.size() >= 12 ? f[2] : -1, k.size() >= 16 ? f[3] : -1);
         }
-        const BlendTarget& b0 = g_state.blend[0];
-        log("  blend %u (%u %u %u %u eq %u %u) mask %x logic %x alpha %x fmt %d", g_state.color.blend_enable[0], b0.src_rgb,
-            b0.dst_rgb, b0.src_a, b0.dst_a, b0.eq_rgb, b0.eq_a, g_state.mask.mask[0], g_state.color.logic_op,
-            g_state.color.alpha_test, t.colors[0] ? int(image_of(t.colors[0])->format) : -1);
-        log("  depth func %u write %u", g_state.depth.depth_func, g_state.depth.depth_write);
-        log("  viewport %d %d %d %d (%d) scissor %d %d %d %d (%d) cull %u front %u depth %g..%g test %u", g_state.viewport[0],
-            g_state.viewport[1], g_state.viewport[2], g_state.viewport[3], g_state.has_viewport, g_state.scissor[0],
-            g_state.scissor[1], g_state.scissor[2], g_state.scissor[3], g_state.has_scissor, g_state.polygon.cull,
-            g_state.polygon.front, g_state.depth_near, g_state.depth_far, g_state.depth.depth_test);
-        log("draw %llu: vs %s fs %s mode %u %s count %d x%d targets %u:%llx depth %llx%s", (unsigned long long)g_stats.done,
+        const BlendTarget& b0 = (*g_state).blend[0];
+        log("  blend %u (%u %u %u %u eq %u %u) mask %x logic %x alpha %x fmt %d", (*g_state).color.blend_enable[0], b0.src_rgb,
+            b0.dst_rgb, b0.src_a, b0.dst_a, b0.eq_rgb, b0.eq_a, (*g_state).mask.mask[0], (*g_state).color.logic_op,
+            (*g_state).color.alpha_test, t.colors[0] ? int(image_of(t.colors[0])->format) : -1);
+        log("  depth func %u write %u", (*g_state).depth.depth_func, (*g_state).depth.depth_write);
+        log("  viewport %d %d %d %d (%d) scissor %d %d %d %d (%d) cull %u front %u depth %g..%g test %u", (*g_state).viewport[0],
+            (*g_state).viewport[1], (*g_state).viewport[2], (*g_state).viewport[3], (*g_state).has_viewport, (*g_state).scissor[0],
+            (*g_state).scissor[1], (*g_state).scissor[2], (*g_state).scissor[3], (*g_state).has_scissor, (*g_state).polygon.cull,
+            (*g_state).polygon.front, (*g_state).depth_near, (*g_state).depth_far, (*g_state).depth.depth_test);
+        log("draw %llu: vs %s fs %s mode %u %s count %d x%d targets %u:%llx depth %llx%s", (unsigned long long)(*g_stats).done,
             vs->hash.c_str(), fs ? fs->hash.c_str() : "-", mode, indexed ? "indexed" : "arrays",
             indexed ? c.i[0] : c.i[1], c.i[3], t.color_count, (unsigned long long)t.colors[0], (unsigned long long)t.depth, tex.c_str());
     }}
@@ -570,9 +570,9 @@ std::pair<uint32_t, uint32_t> int_layout(uint32_t format) {
 }
 
 const uint8_t* attrib_at(const VertexAttrib& va, uint32_t vertex) {
-    if (va.stream >= g_state.streams.size() || va.stream >= 16) return nullptr;
-    const Range& vb = g_state.vertex_buffers[va.stream];
-    uint64_t at = uint64_t(vertex) * g_state.streams[va.stream].stride + va.offset;
+    if (va.stream >= (*g_state).streams.size() || va.stream >= 16) return nullptr;
+    const Range& vb = (*g_state).vertex_buffers[va.stream];
+    uint64_t at = uint64_t(vertex) * (*g_state).streams[va.stream].stride + va.offset;
     if (!vb.address || at + 16 > vb.size) return nullptr;
     return guest_bytes(vb.address + at);
 }
@@ -604,7 +604,7 @@ void trace_skin(bool indexed, const Cmd& c, const ShaderInfo* vs, const ShaderIn
     if (!on || !vs || total >= 60) return;
     int int_loc = -1;
     for (const ShaderIo& in : vs->refl.inputs)
-        if (in.location < g_state.attribs.size() && int_layout(g_state.attribs[in.location].format).first)
+        if (in.location < (*g_state).attribs.size() && int_layout((*g_state).attribs[in.location].format).first)
             int_loc = int(in.location);
     if (int_loc < 0 || seen[vs]++ >= 3) return;
     total++;
@@ -613,9 +613,9 @@ void trace_skin(bool indexed, const Cmd& c, const ShaderInfo* vs, const ShaderIn
         indexed ? "indexed" : "arrays", count, indexed ? c.i[1] : 0, indexed ? 0 : c.i[0], c.i[3]);
     std::string line;
     for (const ShaderIo& in : vs->refl.inputs) {
-        if (in.location >= g_state.attribs.size()) continue;
-        const VertexAttrib& va = g_state.attribs[in.location];
-        uint32_t stride = va.stream < g_state.streams.size() ? g_state.streams[va.stream].stride : 0;
+        if (in.location >= (*g_state).attribs.size()) continue;
+        const VertexAttrib& va = (*g_state).attribs[in.location];
+        uint32_t stride = va.stream < (*g_state).streams.size() ? (*g_state).streams[va.stream].stride : 0;
         char b[80];
         std::snprintf(b, sizeof b, " %u:%x/s%u+%u/%u", in.location, va.format, va.stream, va.offset, stride);
         line += b;
@@ -626,7 +626,7 @@ void trace_skin(bool indexed, const Cmd& c, const ShaderInfo* vs, const ShaderIn
     uint64_t bank_size[18] = {};
     for (const DescriptorBinding& b : vs->refl.bindings) {
         if (b.nvn.source != NvnSource::UniformBlock || b.nvn.index < 0 || b.nvn.index >= 18) continue;
-        const Range& r = g_state.uniforms[0][b.nvn.index];
+        const Range& r = (*g_state).uniforms[0][b.nvn.index];
         const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
         if (b.nvn.bank >= 0 && b.nvn.bank < 18) bank[b.nvn.bank] = p, bank_size[b.nvn.bank] = p ? r.size : 0;
         log("skin:  %s = block %d bank %d, %llu bytes%s%s", b.name.c_str(), b.nvn.index, b.nvn.bank,
@@ -636,7 +636,7 @@ void trace_skin(bool indexed, const Cmd& c, const ShaderInfo* vs, const ShaderIn
     // The vertices (through the index buffer): the first 4 in detail, the largest bone index over all.
     const uint8_t* idx = indexed ? guest_bytes(c.a[0]) : nullptr;
     uint32_t isz = indexed ? index_size(c.mask) : 0;
-    const VertexAttrib& ia = g_state.attribs[int_loc];
+    const VertexAttrib& ia = (*g_state).attribs[int_loc];
     auto [size, n] = int_layout(ia.format);
     uint32_t max_bone = 0, missing = 0;
     for (uint32_t k = 0; k < count; k++) {
@@ -650,8 +650,8 @@ void trace_skin(bool indexed, const Cmd& c, const ShaderInfo* vs, const ShaderIn
         for (uint32_t j = 0; j < n; j++) max_bone = std::max(max_bone, bones[j] = read_uint(p, size, j));
         if (k >= 4) continue;
         std::string w = "-";
-        if (g_state.attribs.size() > 4)
-            if (const uint8_t* q = attrib_at(g_state.attribs[4], v)) {
+        if ((*g_state).attribs.size() > 4)
+            if (const uint8_t* q = attrib_at((*g_state).attribs[4], v)) {
                 char b[64];
                 std::snprintf(b, sizeof b, "%02x%02x%02x%02x %02x%02x%02x%02x", q[0], q[1], q[2], q[3], q[4], q[5],
                               q[6], q[7]);
@@ -682,10 +682,10 @@ void trace_compute_once(const ShaderInfo* cs, uint32_t x, uint32_t y, uint32_t z
                 cs->local_size[1], cs->local_size[2], res.c_str());
             for (const DescriptorBinding& b : cs->refl.bindings) {
                 const Range* r = b.nvn.source == NvnSource::StorageBuffer && b.nvn.index >= 0 && b.nvn.index < 16
-                                     ? &g_state.storage[5][b.nvn.index]
+                                     ? &(*g_state).storage[5][b.nvn.index]
                                  : (b.nvn.source == NvnSource::UniformBlock || b.nvn.source == NvnSource::UniformAsStorage) &&
                                          b.nvn.index >= 0 && b.nvn.index < 18
-                                     ? &g_state.uniforms[5][b.nvn.index]
+                                     ? &(*g_state).uniforms[5][b.nvn.index]
                                      : nullptr;
                 log("  %s: %s %d -> %llx+%llx", b.name.c_str(), source_name(b.nvn.source), b.nvn.index,
                     (unsigned long long)(r ? r->address : 0), (unsigned long long)(r ? r->size : 0));

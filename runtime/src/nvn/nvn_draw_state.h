@@ -1,6 +1,8 @@
 // The draw replay's bound state (nvn_draw.cpp), shared with its debug traces (nvn_draw_trace.cpp).
 #pragma once
 
+#include "nvn_per_thread.h"
+
 #include <array>
 #include <utility>
 #include <vector>
@@ -49,8 +51,8 @@ struct Stats {
     uint64_t breaks_textures = 0, breaks_targets = 0;  // render passes ended by a draw: uploads/layouts, new targets
 };
 
-extern State g_state;
-extern Stats g_stats;
+extern PerThread<State> g_state;  // per replaying thread (docs/PARALLEL_REPLAY.md)
+extern PerThread<Stats> g_stats;
 
 const uint8_t* guest_bytes(uint64_t gpu);
 uint32_t handle_texture(uint64_t handle, uint32_t* sampler);
@@ -129,7 +131,7 @@ struct DrawTextures {
     std::vector<uint64_t> handles;
     std::vector<ResolvedTexture> resolved;
 };
-extern DrawTextures g_textures;  // filled by gather_textures, read by build_sets and the traces of the same draw
+extern PerThread<DrawTextures> g_textures;  // filled by gather_textures, read by build_sets and the traces of the same draw
 enum : uint32_t { kNeedBreak = 1, kSampledPending = 2 };
 uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders);
 void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shaders, const ProgramLayout& layout);

@@ -238,6 +238,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_clears.cpp
     runtime/src/nvn/nvn_mask_clear.cpp
     runtime/src/nvn/nvn_draw_trace.cpp
+    runtime/src/nvn/nvn_parallel.cpp
     runtime/src/vk_bridge.cpp
     runtime/src/vk_swapchain.cpp
     runtime/src/vk_gen.cpp
@@ -290,6 +291,22 @@ if(ANDROID)
     target_link_libraries(${NX_GAME} PRIVATE adrenotools)
     add_dependencies(${NX_GAME} hook_impl main_hook file_redirect_hook gsl_alloc_hook)
     target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden -fno-semantic-interposition -march=armv8.2-a+crypto)
+    # The runtime (not the game's code) with ThinLTO and, when a profile is given, profile-guided optimization: the
+    # replay is spread over many functions and misses the instruction cache (~9 refills per 1000 instructions on the
+    # S20 FE), what code layout by use helps with. NX_PGO=generate: an instrumented build that writes
+    # <data folder>/acnh.profraw after NX_PGO_SECONDS of play (platform_android.cpp); NX_PGO=<file.profdata>: used.
+    set(NX_PGO "" CACHE STRING "Android runtime PGO: generate, or a .profdata file")
+    target_compile_options(${NX_GAME} PRIVATE -flto=thin)
+    target_link_options(${NX_GAME} PRIVATE -flto=thin -Wl,--lto-O3)
+    if(NX_PGO STREQUAL "generate")
+        target_compile_options(${NX_GAME} PRIVATE -fprofile-instr-generate)
+        target_link_options(${NX_GAME} PRIVATE -fprofile-instr-generate)
+        target_compile_definitions(${NX_GAME} PRIVATE NX_PGO_GENERATE)
+    elseif(NX_PGO)
+        target_compile_options(${NX_GAME} PRIVATE "-fprofile-instr-use=${NX_PGO}" -Wno-profile-instr-out-of-date
+                               -Wno-profile-instr-unprofiled -Wno-backend-plugin)
+        target_link_options(${NX_GAME} PRIVATE "-fprofile-instr-use=${NX_PGO}")
+    endif()
     # The glue's ANativeActivity_onCreate must be exported. 16 KB page alignment: Android 15+ devices with 16 KB pages.
     target_link_options(${NX_GAME} PRIVATE -u ANativeActivity_onCreate -Wl,-z,max-page-size=16384)
     # The game's code: lib<game>_game.so, linked against the app's library for the few functions it calls (nx::call,

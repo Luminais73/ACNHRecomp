@@ -21,6 +21,11 @@ bool dummy_ready(const ImageShape& shape) {
 
 VkImageView dummy_view(VkCommandBuffer cb, const ImageShape& shape) {
     VkImageViewType type = view_type(shape);
+    if ((*t_parallel_worker)) {  // made by the replay thread only (docs/PARALLEL_REPLAY.md)
+        auto it = dummies().find(type);
+        if (it != dummies().end() && it->second.image) return it->second.view;
+        return worker_bail("dummy view"), VK_NULL_HANDLE;
+    }
     auto& d = dummies()[type];
     if (d.image) return d.view;
     bool cube = type == VK_IMAGE_VIEW_TYPE_CUBE || type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;

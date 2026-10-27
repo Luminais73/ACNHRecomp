@@ -103,7 +103,8 @@ void hang_note(const ShaderInfo* vs, const ShaderInfo* fs) {
         const ShaderInfo *vs = nullptr, *fs = nullptr;
         uint64_t serial = 0;
     };
-    static Seen seen[512];
+    static PerThread<Seen[512]> seen_pt;  // per replaying thread (docs/PARALLEL_REPLAY.md)
+    auto& seen = *seen_pt;
     const uint64_t serial = g_hang_serial.load(std::memory_order_relaxed);
     Seen& e = seen[((reinterpret_cast<uintptr_t>(vs) >> 4) ^ (reinterpret_cast<uintptr_t>(fs) >> 6)) & 511];
     if (e.serial == serial && e.vs == vs && e.fs == fs) return;
@@ -616,6 +617,7 @@ bool begin(bool replay = false) {
 // into Vulkan), vkQueueSubmit (Metal encoding happens inside it), fences waited for, the rest of gpu_submit (object
 // drain, image frees, write-backs), and gpu_present as a whole; bytes through the upload buffer.
 struct Timing {
+    uint64_t replay_cpu_ns = 0;
     uint64_t submits = 0, replay_ns = 0, encode_ns = 0, fence_ns = 0, submit_ns = 0, present_ns = 0, upload_bytes = 0;
 } g_timing;
 
@@ -672,6 +674,7 @@ void log_timing(uint64_t frames) {
     last = now;
     const Timing& t = g_timing;
     uint64_t known = t.replay_ns + t.encode_ns + t.fence_ns;
+    log("nvn/vk: per frame over %llu: replay on the CPU %.2f ms of it", (unsigned long long)frames, ms(t.replay_cpu_ns));
     log("nvn/vk: per frame over %llu: %.1f fps, %.1f submits, replay %.2f ms, submit (encode) %.2f ms, fence wait "
         "%.2f ms, other %.2f ms, present %.2f ms, upload %.2f MB%s",
         (unsigned long long)frames, fps, double(t.submits) / double(frames), ms(t.replay_ns), ms(t.encode_ns),
@@ -724,18 +727,31 @@ void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_
     // Pipelined: the part up to the last dispatch is queued as soon as it is recorded (nvn_frames.cpp). Not with the
     // profile or the zero-draw queries: they span the submit, which is then waited for whole.
     size_t split_after = gpu_profile_on() || zero_draws_on() ? SIZE_MAX : frame_plan_split(lists);
+    if (parallel_plan_on()) parallel_plan_frame(lists);  // docs/PARALLEL_REPLAY.md, P0: logged only
     uint64_t t0 = plat::monotonic_ns();
+    timespec cpu0{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0);
     const FrameTimes f0 = frame_times();
     Targets st;
-    for (size_t k = 0; k < lists.size(); k++) {
-        replay_list(g_cb, st, *lists[k], 0);
-        // After the last list with a dispatch, unless nothing follows it (replay_list may have split inside a list).
-        g_cb = k == split_after && k + 1 < lists.size() ? frame_split(g_cb) : frame_cb(g_cb);
+    if (parallel_replay_on()) {  // docs/PARALLEL_REPLAY.md
+        parallel_replay(g_cb, st, lists, split_after);
+        g_cb = frame_cb(g_cb);
+    } else {
+        for (size_t k = 0; k < lists.size(); k++) {
+            replay_list(g_cb, st, *lists[k], 0);
+            // After the last list with a dispatch, unless nothing follows it (replay_list may have split inside a list).
+            g_cb = k == split_after && k + 1 < lists.size() ? frame_split(g_cb) : frame_cb(g_cb);
+        }
     }
     draw_end_rendering(g_cb);
     const FrameTimes f1 = frame_times();  // the first part's submit and ring waits are not replay time
     g_timing.submits++;
     g_timing.replay_ns += plat::monotonic_ns() - t0 - (f1.encode_ns - f0.encode_ns) - (f1.fence_ns - f0.fence_ns);
+    {  // the replay thread's own CPU time over the same span: the rest of the replay time it was off the CPU
+        timespec cpu1{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu1);
+        g_timing.replay_cpu_ns += uint64_t(cpu1.tv_sec - cpu0.tv_sec) * 1000000000ull + uint64_t(cpu1.tv_nsec) - uint64_t(cpu0.tv_nsec);
+    }
     g_timing.upload_bytes += async ? frame_upload_used() : g_upload_used;
     gpu_profile_mark(g_cb, "end");
     if (async)  // the profile, zero-draw queries and snapshots read this submit's results right below: waited for

@@ -5,6 +5,7 @@
 // Here the submit keeps one copy per written guest range (the ranges are disjoint, keyed by host address). Writers and
 // readers of a range bind that copy; ranges that meet are merged into a new copy on the GPU (vkCmdCopyBuffer, so in
 // command order); each range is written back once. NX_COMPUTE_SEPARATE=1: the previous behaviour.
+#include <atomic>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -33,9 +34,9 @@ struct Region {
 using Regions = std::map<const uint8_t*, Region>;
 using It = Regions::iterator;
 Regions g_regions;
-bool g_read = false;  // a copy was bound for reading since the last write_after_read
-uint64_t g_binds = 0;  // written_bind calls, ever (nvn_frames.cpp: did a dispatch write storage after the split)
-uint64_t g_shared = 0, g_merged = 0, g_composed = 0, g_indirect = 0;  // for written_log
+std::atomic<bool> g_read{false};  // a copy was bound for reading since the last write_after_read
+std::atomic<uint64_t> g_binds{0};  // written_bind calls, ever (nvn_frames.cpp: did a dispatch write storage after the split)
+std::atomic<uint64_t> g_shared{0}, g_merged{0}, g_composed{0}, g_indirect{0};  // for written_log
 
 // The regions overlapping [p, p + size), in address order.
 // Whether [p, p + size) meets a written range, without building the list (asked for every buffer of every draw).
@@ -161,7 +162,9 @@ Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_
 bool written_read(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out) {
     if (p && size && !written_separate() && late_pending(p, size)) {
         // A previous submit's results not yet in guest memory (late write-backs, nvn_frames.cpp): a copy of its own,
-        // those bytes and this submit's written ones copied in on the GPU, newest last.
+        // those bytes and this submit's written ones copied in on the GPU, newest last. The replay thread's
+        // (docs/PARALLEL_REPLAY.md).
+        if (worker_bail("written range")) return false;
         std::vector<It> regions = g_regions.empty() ? std::vector<It>{} : overlapping(p, size);
         if (It it = containing(p, size, padded, align, regions); !regions.empty() && it != g_regions.end()) {
             g_shared++, g_read = true;
@@ -188,6 +191,7 @@ bool written_read(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t 
     }
     // Partly written, or not bindable in place: a copy of its own, the written parts copied in on the GPU. This is
     // what the range holds at this point of the submit (later dispatches do not change it).
+    if (worker_bail("written range")) return false;
     draw_end_rendering(cb, 2);
     out = upload_alloc(std::max(padded, size), std::max<uint64_t>(align, 16));
     std::memcpy(out.ptr, p, size);
@@ -218,11 +222,11 @@ bool written_indirect(VkCommandBuffer cb, const uint8_t* p) {
 bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in) {
     // Vertex buffers: the bound ranges of the streams the vertex shader reads (the pipeline declares no others).
     for (const ShaderIo& io : vs->refl.inputs)
-        if (io.location < g_state.attribs.size() && g_state.attribs[io.location].stream < 15)
-            in.used |= 1u << g_state.attribs[io.location].stream;
+        if (io.location < (*g_state).attribs.size() && (*g_state).attribs[io.location].stream < 15)
+            in.used |= 1u << (*g_state).attribs[io.location].stream;
     for (uint32_t s = 0; s < 15; s++) {
         if (!(in.used >> s & 1)) continue;
-        const Range& r = g_state.vertex_buffers[s];
+        const Range& r = (*g_state).vertex_buffers[s];
         const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
         uint64_t size = p ? std::min<uint64_t>(r.size, 64ull << 20) : 0;
         in.vertex[s] = read_upload(cb, p, size, std::max<uint64_t>((size + 15) & ~15ull, 16), 16);
@@ -273,11 +277,11 @@ void check_vertex_ranges(const ShaderInfo* vs, const ShaderInfo* fs, bool indexe
     }
     uint64_t inst_hi = uint64_t(uint32_t(c.i[2])) + uint32_t(std::max(1, c.i[3])) - 1;
     for (const ShaderIo& io : vs->refl.inputs) {
-        if (io.location >= g_state.attribs.size()) continue;
-        const VertexAttrib& va = g_state.attribs[io.location];
-        if (va.stream >= 15 || va.stream >= g_state.streams.size() || !(in.used >> va.stream & 1)) continue;
-        const VertexStream& st = g_state.streams[va.stream];
-        const Range& r = g_state.vertex_buffers[va.stream];
+        if (io.location >= (*g_state).attribs.size()) continue;
+        const VertexAttrib& va = (*g_state).attribs[io.location];
+        if (va.stream >= 15 || va.stream >= (*g_state).streams.size() || !(in.used >> va.stream & 1)) continue;
+        const VertexStream& st = (*g_state).streams[va.stream];
+        const Range& r = (*g_state).vertex_buffers[va.stream];
         uint64_t last = st.divisor ? inst_hi / st.divisor : hi;
         uint64_t end = last * st.stride + va.offset + vk_block_bytes(vk_vertex_format(va.format));
         uint64_t copied = r.address && guest_bytes(r.address) ? std::min<uint64_t>(r.size, 64ull << 20) : 0;
@@ -309,11 +313,11 @@ std::vector<WriteBack> written_take() {
     std::vector<WriteBack> v;
     v.reserve(g_regions.size());
     for (auto& [p, r] : g_regions) v.push_back({r.up.ptr, const_cast<uint8_t*>(p), r.size, r.before});
-    g_regions.clear();
+    g_regions.clear(), (*g_upload_epoch)++;
     return v;
 }
 
-void written_reset() { g_regions.clear(), g_read = false; }
+void written_reset() { g_regions.clear(), g_read = false, (*g_upload_epoch)++; }
 
 void written_log() {
     if (g_shared + g_merged + g_composed + g_indirect)

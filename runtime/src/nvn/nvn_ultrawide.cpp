@@ -801,7 +801,7 @@ void pane_calculate(CPU& c) {
 }  // namespace
 NX_HOOK(0x27d4c0, pane_calculate);
 
-UwTarget g_uw;
+PerThread<UwTarget> g_uw;
 
 void uw_span(int32_t& x, int32_t& w, uint32_t extent, float f) {
     int64_t x0 = std::llround(double(x) * f);
@@ -828,8 +828,13 @@ bool uw_vs_scaled(const ShaderInfo* vs) {
     static std::map<const ShaderInfo*, bool> cache;
     static const std::string off = std::getenv("NX_UW_NOSCALE") ? std::getenv("NX_UW_NOSCALE") : "";
     static const std::string only = std::getenv("NX_UW_SCALE") ? std::getenv("NX_UW_SCALE") : "";
+    static PerThread<std::unordered_map<const ShaderInfo*, bool>*> front_pt;  // the thread's own answers, no lock
+    auto*& front = *front_pt;
+    if (!front) front = new std::unordered_map<const ShaderInfo*, bool>();
+    if (auto f = front->find(vs); f != front->end()) return f->second;
+    std::lock_guard lk(cache_mutex());  // the parallel replay's workers too (docs/PARALLEL_REPLAY.md)
     auto it = cache.find(vs);
-    if (it != cache.end()) return it->second;
+    if (it != cache.end()) return (*front)[vs] = it->second;
     bool scaled = false;
     for (const DescriptorBinding& b : vs->refl.bindings)
         if (b.type == DescriptorType::UniformBuffer && b.name != "support_buffer") scaled = true;

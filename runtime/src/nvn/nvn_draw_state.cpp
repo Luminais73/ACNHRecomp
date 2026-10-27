@@ -12,7 +12,7 @@ namespace nx::nvn {
 using namespace replay;
 
 void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets) {
-    State& s = g_state;
+    State& s = (*g_state);
     auto blob = [&](size_t size) -> const uint8_t* {
         return c.blob < list.blobs.size() && list.blobs[c.blob].size() >= size ? list.blobs[c.blob].data() : nullptr;
     };
@@ -103,12 +103,12 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
             static const char* uub = std::getenv("NX_TRACE_UUB");
             static const uint64_t uub_from = uub ? std::strtoull(uub, nullptr, 10) : 0;
             static int uub_n = 0;
-            if (uub && g_stats.done >= uub_from && uub_n++ < 1500 && c.blob < list.blobs.size()) {
+            if (uub && (*g_stats).done >= uub_from && uub_n++ < 1500 && c.blob < list.blobs.size()) {
                 const auto& b = list.blobs[c.blob];
                 float f[8] = {};
                 std::memcpy(f, b.data(), std::min<size_t>(b.size(), sizeof f));
                 log("uub before draw %llu: buffer %llx size %llu offset %llu data %zu bytes: %g %g %g %g | %g %g %g %g",
-                    (unsigned long long)g_stats.done, (unsigned long long)c.a[0], (unsigned long long)c.a[1],
+                    (unsigned long long)(*g_stats).done, (unsigned long long)c.a[0], (unsigned long long)c.a[1],
                     (unsigned long long)off, b.size(), f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
             }
             if (c.blob < list.blobs.size())

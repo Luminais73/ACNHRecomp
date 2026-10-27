@@ -9,6 +9,7 @@
 // with some channels masked off, is never a loadOp; it runs in the pass, with vkCmdClearAttachments on the scissor
 // rectangle, or, masked, a fullscreen draw with that write mask (nvn_mask_clear.cpp). NX_CLEARS_SCISSOR=1 (off: it broke the course) and
 // NX_CLEARS_NO_MASK=1: whole-target and all-channel clears, the old way (bisecting).
+#include <unordered_set>
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
@@ -33,9 +34,10 @@ struct Pending {
     VkImageAspectFlags ds = 0;
     VkClearValue depth{};
 };
-Pending g_pending;
-uint64_t g_deferred = 0, g_as_load = 0, g_alone = 0, g_transfer = 0;
-uint64_t g_scissored = 0, g_masked = 0, g_mask_fallback = 0, g_scissor_lost = 0;  // G6
+// Per replaying thread (docs/PARALLEL_REPLAY.md).
+PerThread<Pending> g_pending;
+PerThread<uint64_t> g_deferred, g_as_load, g_alone, g_transfer;
+PerThread<uint64_t> g_scissored, g_masked, g_mask_fallback, g_scissor_lost;  // G6
 
 // begin_rendering's render area for these targets: the smallest attachment at its level.
 VkExtent2D targets_extent(const Targets& t) {
@@ -55,27 +57,27 @@ VkExtent2D targets_extent(const Targets& t) {
 }  // namespace
 
 bool clears_pending_image(const GpuImage* img) {
-    if (!g_pending.on || !img) return false;
-    for (uint32_t k = 0; k < g_pending.t.color_count; k++)
-        if ((g_pending.colors >> k & 1) && g_pending.t.colors[k] && image_of(g_pending.t.colors[k]) == img) return true;
-    return g_pending.ds && g_pending.t.depth && image_of(g_pending.t.depth) == img;
+    if (!(*g_pending).on || !img) return false;
+    for (uint32_t k = 0; k < (*g_pending).t.color_count; k++)
+        if (((*g_pending).colors >> k & 1) && (*g_pending).t.colors[k] && image_of((*g_pending).t.colors[k]) == img) return true;
+    return (*g_pending).ds && (*g_pending).t.depth && image_of((*g_pending).t.depth) == img;
 }
 
 namespace {
 
 // Where each pending cleared attachment is in `t` (slot, or -1): the same texture and view at the same render area.
 bool pending_slots(const Targets& t, int slot[9]) {
-    const Targets& p = g_pending.t;
+    const Targets& p = (*g_pending).t;
     for (uint32_t k = 0; k < 9; k++) slot[k] = -1;
     for (uint32_t k = 0; k < p.color_count; k++) {
-        if (!(g_pending.colors >> k & 1)) continue;
+        if (!((*g_pending).colors >> k & 1)) continue;
         for (uint32_t j = 0; j < t.color_count && slot[k] < 0; j++)
             if (t.colors[j] == p.colors[k] && t.views.level[j] == p.views.level[k] &&
                 t.views.layer[j] == p.views.layer[k] && t.views.format[j] == p.views.format[k])
                 slot[k] = int(j);
         if (slot[k] < 0) return false;
     }
-    if (g_pending.ds) {
+    if ((*g_pending).ds) {
         if (t.depth != p.depth || t.views.level[8] != p.views.level[8] || t.views.layer[8] != p.views.layer[8])
             return false;
         slot[8] = 8;
@@ -93,28 +95,28 @@ bool pending_slots(const Targets& t, int slot[9]) {
 
 bool clears_pending_other(const Targets& t) {
     int slot[9];
-    return g_pending.on && !pending_slots(t, slot);
+    return (*g_pending).on && !pending_slots(t, slot);
 }
 
 uint32_t clears_apply(const Targets& t, VkRenderingAttachmentInfo* colors, VkRenderingAttachmentInfo& depth,
                       VkRenderingAttachmentInfo& stencil) {
     int slot[9];
-    if (!g_pending.on || !pending_slots(t, slot)) return 0;
+    if (!(*g_pending).on || !pending_slots(t, slot)) return 0;
     uint32_t cleared = 0;
     for (uint32_t k = 0; k < 8; k++)
         if (slot[k] >= 0 && colors[slot[k]].imageView) {
             colors[slot[k]].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            colors[slot[k]].clearValue = g_pending.color[k];
+            colors[slot[k]].clearValue = (*g_pending).color[k];
             cleared |= 1u << slot[k];
         }
-    if (g_pending.ds && depth.imageView) {
-        depth.clearValue = stencil.clearValue = g_pending.depth;
-        if (g_pending.ds & VK_IMAGE_ASPECT_DEPTH_BIT) depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        if (g_pending.ds & VK_IMAGE_ASPECT_STENCIL_BIT) stencil.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    if ((*g_pending).ds && depth.imageView) {
+        depth.clearValue = stencil.clearValue = (*g_pending).depth;
+        if ((*g_pending).ds & VK_IMAGE_ASPECT_DEPTH_BIT) depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        if ((*g_pending).ds & VK_IMAGE_ASPECT_STENCIL_BIT) stencil.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         cleared |= 1u << 8;
     }
-    g_pending.on = false;
-    g_as_load++;
+    (*g_pending).on = false;
+    (*g_as_load)++;
     return cleared;
 }
 
@@ -138,30 +140,31 @@ bool transfer_clears() {
 bool clears_transfer(VkCommandBuffer cb, const Targets& t) {
     GpuImage* imgs[9] = {};
     for (uint32_t k = 0; k < t.color_count; k++) {
-        if (!(g_pending.colors >> k & 1)) continue;
+        if (!((*g_pending).colors >> k & 1)) continue;
         GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
         if (!img) continue;
         if (img->view_type == VK_IMAGE_VIEW_TYPE_3D || view_format(*img, t.views.format[k]) != img->format) return false;
         imgs[k] = img;
     }
-    if (g_pending.ds) {
+    if ((*g_pending).ds) {
         GpuImage* d = t.depth ? image_of(t.depth) : nullptr;
-        if (d && (d->aspect & g_pending.ds) != g_pending.ds) return false;
+        if (d && (d->aspect & (*g_pending).ds) != (*g_pending).ds) return false;
         imgs[8] = d;
     }
     for (uint32_t k = 0; k < 9; k++) {
         GpuImage* img = imgs[k];
         if (!img) continue;
+        if ((img->layout != VK_IMAGE_LAYOUT_GENERAL || !img->rendered) && worker_bail("clear target")) return true;
         transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);  // as begin_rendering: rendered images stay GENERAL
-        img->rendered = true;
+        if (!img->rendered) img->rendered = true;
         uint32_t level = std::min<uint32_t>(t.views.level[k], img->levels - 1);
         uint32_t layer = std::min<uint32_t>(t.views.layer[k], img->layers - 1);
         if (k < 8) {
             VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, level, 1, layer, 1};
-            p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &g_pending.color[k].color, 1, &r);
+            p_vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &(*g_pending).color[k].color, 1, &r);
         } else {
-            VkImageSubresourceRange r{g_pending.ds, level, 1, layer, 1};
-            p_vkCmdClearDepthStencilImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &g_pending.depth.depthStencil, 1, &r);
+            VkImageSubresourceRange r{(*g_pending).ds, level, 1, layer, 1};
+            p_vkCmdClearDepthStencilImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &(*g_pending).depth.depthStencil, 1, &r);
         }
     }
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -169,52 +172,72 @@ bool clears_transfer(VkCommandBuffer cb, const Targets& t) {
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr,
                            0, nullptr);
-    g_pending.on = false;
-    g_transfer++;
+    (*g_pending).on = false;
+    (*g_transfer)++;
     return true;
 }
 
 void clears_flush(VkCommandBuffer cb) {
-    if (!g_pending.on) return;
-    Targets t = g_pending.t;
-    g_alone++;
+    if (!(*g_pending).on) return;
+    Targets t = (*g_pending).t;
+    (*g_alone)++;
     if (transfer_clears() && clears_transfer(cb, t)) return;
-    g_as_load--;           // counted by clears_apply
+    (*g_as_load)--;           // counted by clears_apply
     pass_begin(cb, t);     // takes the clears as its loadOps
     pass_end_only(cb, 3);
 }
 
-void clears_begin_submit() { g_pending.on = false; }
+void clears_begin_submit() { (*g_pending).on = false; }
 
 void clears_log() {
     log("nvn clears: %llu deferred to the next pass on their targets, %llu of those passes with draws, %llu alone "
-        "(%llu of those as transfer clears)", (unsigned long long)g_deferred, (unsigned long long)g_as_load,
-        (unsigned long long)g_alone, (unsigned long long)g_transfer);
+        "(%llu of those as transfer clears)", (unsigned long long)(*g_deferred), (unsigned long long)(*g_as_load),
+        (unsigned long long)(*g_alone), (unsigned long long)(*g_transfer));
     log("nvn clears: %llu scissored (%llu of those outside the pass: whole target), %llu channel-masked (%llu of those "
-        "all channels: integer target or no pipeline)", (unsigned long long)g_scissored,
-        (unsigned long long)g_scissor_lost, (unsigned long long)g_masked, (unsigned long long)g_mask_fallback);
+        "all channels: integer target or no pipeline)", (unsigned long long)(*g_scissored),
+        (unsigned long long)(*g_scissor_lost), (unsigned long long)(*g_masked), (unsigned long long)(*g_mask_fallback));
 }
 
 // Clears run inside the render pass of the current targets (vkCmdClearAttachments), or become the loadOps of the
 // next one (above). A transfer clear between passes was a Metal encoder of its own and made the next pass reload its
 // targets: most of the ~25 ms per frame of GPU time "outside passes" (docs/nvn/DEBUG.md #31). Depth and stencil
 // clears honour the call's masks.
+// Whether this clear-on-bind repeats one of this frame (and counts it as done). The replay thread's.
+bool clear_once_repeat(const GpuImage* img, bool color) {
+    static std::unordered_map<const GpuImage*, uint64_t> cleared[2];  // image -> 1 + the present count then
+    static uint64_t kept = 0, skipped = 0;
+    uint64_t& at = cleared[color][img];
+    bool repeat = at == g_replay_presents + 1;
+    if ((repeat ? ++skipped : ++kept) % 20000 == 0)
+        log("nvn: clear-on-bind: %llu replayed, %llu repeats in a frame skipped", (unsigned long long)kept,
+            (unsigned long long)skipped);
+    if (!repeat) at = g_replay_presents + 1;
+    return repeat;
+}
+
+PerThread<const std::unordered_set<const Cmd*>*> t_clear_once_skip;
+
+// For the parallel replay's plan: the clear-on-bind's decision, taken in order (true: skipped).
+bool clear_once_plan(const Targets& t, const Cmd& c) {
+    bool color = c.op == Cmd::ClearColor;
+    uint64_t guest = color ? (c.n < 8 ? t.colors[c.n] : 0) : t.depth;
+    GpuImage* img = guest ? image_of(guest) : nullptr;
+    if (!img || color != (img->aspect == VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+    if (color && !(c.mask & 0xF)) return false;
+    return clear_once_repeat(img, color);
+}
+
 void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
+    if ((*t_bail)) return;
     bool color = c.op == Cmd::ClearColor;
     uint64_t guest = color ? (c.n < 8 ? t.colors[c.n] : 0) : t.depth;
     GpuImage* img = guest ? image_of(guest) : nullptr;
     if (!img || color != (img->aspect == VK_IMAGE_ASPECT_COLOR_BIT)) return;
     if (color && !(c.mask & 0xF)) return;  // no channel enabled
     if (c.mask & kClearOnce) {  // a clear-on-bind: the first of this image (and aspect) in the frame only
-        static std::unordered_map<const GpuImage*, uint64_t> cleared[2];  // image -> 1 + the present count then
-        static uint64_t kept = 0, skipped = 0;
-        uint64_t& at = cleared[color][img];
-        bool repeat = at == g_replay_presents + 1;
-        if ((repeat ? ++skipped : ++kept) % 20000 == 0)
-            log("nvn: clear-on-bind: %llu replayed, %llu repeats in a frame skipped", (unsigned long long)kept,
-                (unsigned long long)skipped);
-        if (repeat) return;
-        at = g_replay_presents + 1;
+        // A parallel replay worker: decided in order by the replay thread when it planned the chunk.
+        // (and its own replay of a chunk a worker gave up: the same decisions)
+        if ((*t_clear_once_skip) ? (*t_clear_once_skip)->count(&c) != 0 : clear_once_repeat(img, color)) return;
     }
     VkClearAttachment a{};
     if (color) {
@@ -236,9 +259,9 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
     static const bool no_mask = std::getenv("NX_CLEARS_NO_MASK") != nullptr;
     // The part of the target the clear covers: the scissor (pass coordinates, as the draws') within the target.
     VkRect2D rect{{0, 0}, full};
-    if (!no_scissor && replay::g_state.has_scissor) {
-        int32_t s[4] = {replay::g_state.scissor[0], replay::g_state.scissor[1], replay::g_state.scissor[2],
-                        replay::g_state.scissor[3]};
+    if (!no_scissor && (*replay::g_state).has_scissor) {
+        int32_t s[4] = {(*replay::g_state).scissor[0], (*replay::g_state).scissor[1], (*replay::g_state).scissor[2],
+                        (*replay::g_state).scissor[3]};
         if (img->uw) {  // a resized screen target (nvn_ultrawide.cpp): the guest's span, scaled
             uw_span(s[0], s[2], full.width, img->sx);
             uw_span(s[1], s[3], full.height, img->sy);
@@ -252,22 +275,22 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
     bool scissored =
         rect.offset.x || rect.offset.y || rect.extent.width < full.width || rect.extent.height < full.height;
     bool masked = color && !no_mask && (c.mask & 0xF) != 0xF;
-    g_scissored += scissored, g_masked += masked;
+    (*g_scissored) += scissored, (*g_masked) += masked;
     if (!transfer && !eager && !scissored && !masked && !pass_open_on(t)) {
         VkExtent2D e = targets_extent(t);
         if (full.width <= e.width && full.height <= e.height) {  // the pass covers it: a loadOp can clear it
             pass_end_only(cb, 3);  // other targets' pass, and their pending clears
-            if (g_pending.on && !targets_same(g_pending.t, t)) clears_flush(cb);  // its slots index its own targets
-            if (!g_pending.on) g_pending = {true, t};
+            if ((*g_pending).on && !targets_same((*g_pending).t, t)) clears_flush(cb);  // its slots index its own targets
+            if (!(*g_pending).on) (*g_pending) = {true, t};
             if (color) {
-                g_pending.colors |= 1u << c.n;
-                g_pending.color[c.n] = a.clearValue;
+                (*g_pending).colors |= 1u << c.n;
+                (*g_pending).color[c.n] = a.clearValue;
             } else {
-                if (a.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) g_pending.depth.depthStencil.depth = c.f[0];
-                if (a.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) g_pending.depth.depthStencil.stencil = uint32_t(c.i[0]);
-                g_pending.ds |= a.aspectMask;
+                if (a.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) (*g_pending).depth.depthStencil.depth = c.f[0];
+                if (a.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) (*g_pending).depth.depthStencil.stencil = uint32_t(c.i[0]);
+                (*g_pending).ds |= a.aspectMask;
             }
-            g_deferred++;
+            (*g_deferred)++;
             replay::trace_pass("clear deferred: slot, mask", t, color ? c.n : 8, c.mask);
             return;
         }
@@ -281,8 +304,9 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
     bool in_pass = rect.offset.x + rect.extent.width <= pe.width && rect.offset.y + rect.extent.height <= pe.height;
     if (transfer || !in_pass) {
         // The pass is smaller than this target (a larger shared depth buffer): clear all of it, outside the pass.
-        g_scissor_lost += scissored, g_mask_fallback += masked;
+        (*g_scissor_lost) += scissored, (*g_mask_fallback) += masked;
         draw_end_rendering(cb, 4);
+        if (img->layout != VK_IMAGE_LAYOUT_GENERAL && worker_bail("clear layout")) return;
         transition(cb, *img, VK_IMAGE_LAYOUT_GENERAL);
         VkImageSubresourceRange r{a.aspectMask, std::min<uint32_t>(level, img->levels - 1), 1,
                                   std::min<uint32_t>(color ? t.views.layer[c.n] : t.views.layer[8], img->layers - 1), 1};
@@ -296,10 +320,10 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
         pass_mark_written(1u << c.n);
         return;
     }
-    g_mask_fallback += masked;
+    (*g_mask_fallback) += masked;
     VkClearRect r{rect, 0, 1};  // unscissored: all of the target, which is the pass's area
     replay::trace_pass("clear in pass: slot, mask | bound channel mask << 8", t, color ? c.n : 8,
-                       c.mask | (color ? uint32_t(replay::g_state.mask.mask[c.n]) << 8 : 0));
+                       c.mask | (color ? uint32_t((*replay::g_state).mask.mask[c.n]) << 8 : 0));
     p_vkCmdClearAttachments(cb, 1, &a, 1, &r);
     pass_mark_written(color ? 1u << c.n : 1u << 8);  // a later draw sampling it needs a fresh pass
 }

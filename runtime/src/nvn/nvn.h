@@ -9,6 +9,8 @@
 #pragma once
 
 #include <pthread.h>
+
+#include "nvn_per_thread.h"
 #include <type_traits>
 #include <cstdint>
 #include <atomic>
@@ -89,7 +91,9 @@ inline thread_local ReplayTls t_replay;
 // sets both; other threads still use their own t_replay.
 inline std::atomic<pthread_t> g_replay_thread{};
 inline ReplayTls* g_replay_tls = nullptr;
+inline ReplayTls g_worker_replay_tls[kReplaySlots];  // the parallel replay's workers' (nvn_per_thread.h): no TLS
 inline ReplayTls& replay_tls() {
+    if (const int s = replay_slot()) return g_worker_replay_tls[s];
     if (g_replay_tls && pthread_equal(pthread_self(), g_replay_thread.load(std::memory_order_relaxed))) return *g_replay_tls;
     return t_replay;
 }
@@ -120,14 +124,16 @@ T* get(uint64_t guest) {
     // emptied the cache below during a replay (get<Texture> was 8.5% of the replay thread). Not for nulls: an object
     // created after the mark resolves to the current one (DEBUG.md #64). NX_RESOLVE_CACHE=0: off.
     ReplayTls& tl = replay_tls();
-    if (uint64_t serial = tl.serial; serial && tl.mark && resolve_cache_on()) {
+    static const bool cache_on = resolve_cache_on();
+    if (uint64_t serial = tl.serial; serial && tl.mark && cache_on) {
         ReplaySlot* table;
         if constexpr (std::is_same_v<T, Texture>) {
             if (!tl.textures) tl.textures = new ReplaySlot[1024];  // per thread, for the process's life
             table = tl.textures;
         } else {
-            thread_local ReplaySlot own[1024];
-            table = own;
+            static PerThread<ReplaySlot*> own;  // per replaying thread (nvn_per_thread.h), made on first use
+            if (!*own) *own = new ReplaySlot[1024]();
+            table = *own;
         }
         ReplaySlot& s = table[((guest >> 4) ^ (guest >> 14)) & 1023];
         if (s.serial == serial && s.guest == guest) return static_cast<T*>(s.object);

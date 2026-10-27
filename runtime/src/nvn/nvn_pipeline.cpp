@@ -28,6 +28,14 @@
 
 namespace nx::nvn {
 
+// The caches of views, layouts, samplers and pipelines, shared by the replay thread and the parallel replay workers
+// (docs/PARALLEL_REPLAY.md): held on their slow paths (a lookup past the thread's own front entries, a creation).
+// Recursive: a layout's creation asks for set layouts, a pipeline's for its layout.
+std::recursive_mutex& cache_mutex() {
+    static std::recursive_mutex m;
+    return m;
+}
+
 using namespace nx::vk;
 
 // NVN views carry a format: the game renders into RGBA8 textures through sRGB views (the GPU encodes on write and
@@ -184,7 +192,10 @@ struct ViewHit {
     SampledKey key{};
     VkImageView view = VK_NULL_HANDLE;
 };
-ViewHit g_view_hits[256];
+// Per thread; emptied when forget_image_views bumps the generation (an image's views are about to be destroyed).
+PerThread<TlsArray<ViewHit, 256>> g_view_hits;
+PerThread<uint64_t> g_view_hits_gen;
+std::atomic<uint64_t> g_views_gen{1};
 
 bool identity(const VkComponentMapping& m) {
     auto id = [](VkComponentSwizzle s, VkComponentSwizzle own) { return s == VK_COMPONENT_SWIZZLE_IDENTITY || s == own; };
@@ -233,8 +244,13 @@ VkImageView view_of(GpuImage& img, VkImageViewType type, const ViewInfo& view) {
     uint32_t mapping = uint32_t(m.r) | uint32_t(m.g) << 8 | uint32_t(m.b) << 16 | uint32_t(m.a) << 24;
     SampledKey key{img.image, type, mapping, range, uint64_t(format)};
     uint64_t h = uintptr_t(img.image) >> 4 ^ range * 31 ^ mapping ^ uint64_t(type) << 5 ^ uint64_t(format);
-    ViewHit& hit = g_view_hits[(h ^ h >> 8) & 255];
+    if (uint64_t gen = g_views_gen.load(std::memory_order_acquire); (*g_view_hits_gen) != gen) [[unlikely]] {
+        for (ViewHit& h : (*g_view_hits)) h = {};
+        (*g_view_hits_gen) = gen;
+    }
+    ViewHit& hit = (*g_view_hits)[(h ^ h >> 8) & 255];
     if (hit.view && hit.key == key) return hit.view;
+    std::lock_guard lk(cache_mutex());
     auto& v = cache[key];
     if (!v) {
         VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -267,6 +283,7 @@ bool ufloat_raw() {
 }  // namespace
 
 bool descriptor_layout_counts(VkDescriptorSetLayout layout, uint32_t (&out)[16]) {
+    std::lock_guard lk(cache_mutex());
     auto it = layout_counts().find(layout);
     if (it == layout_counts().end()) return false;
     std::copy(it->second.begin(), it->second.end(), out);
@@ -277,10 +294,16 @@ bool descriptor_layout_counts(VkDescriptorSetLayout layout, uint32_t (&out)[16])
 
 const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages) {
     static std::map<std::vector<const ShaderInfo*>, ProgramLayout> cache;
-    static const std::pair<const std::vector<const ShaderInfo*>, ProgramLayout>* last = nullptr;  // entries stay
+    static PerThread<const std::pair<const std::vector<const ShaderInfo*>, ProgramLayout>*> last_pt;  // entries stay
+    auto& last = *last_pt;
     if (last && last->first == stages) return last->second;  // runs of draws use one program
+    static PerThread<std::map<std::vector<const ShaderInfo*>, const std::pair<const std::vector<const ShaderInfo*>, ProgramLayout>*>*> front_pt;
+    auto& front = *front_pt;
+    if (!front) front = new std::map<std::vector<const ShaderInfo*>, const std::pair<const std::vector<const ShaderInfo*>, ProgramLayout>*>();
+    if (auto f = front->find(stages); f != front->end()) return (last = f->second)->second;
+    std::lock_guard lk(cache_mutex());
     auto it = cache.find(stages);
-    if (it != cache.end()) return (last = &*it)->second;
+    if (it != cache.end()) return (*front)[stages] = last = &*it, last->second;
     std::map<uint32_t, VkDescriptorSetLayoutBinding> sets[4];
     for (const ShaderInfo* s : stages)
         for (const DescriptorBinding& b : s->refl.bindings) {
@@ -633,7 +656,7 @@ PKey bytes_of(const PipelineKey& k) {
 // Only draws into screen targets are skipped (pipeline_skip_allowed): what the game draws once into a texture of
 // its own (the colour-grading LUT of a room, rendered slice by slice when it loads) was lost for good, and the tent's
 // picture came out black, or white over stale memory.
-bool g_skip_allowed = true;
+PerThread<bool> g_skip_allowed{true};
 
 bool async_skip() {
     static const bool on = [] {
@@ -645,7 +668,7 @@ bool async_skip() {
 #endif
         return e && e[0] == '1' && pool().threads > 0;
     }();
-    return on && g_skip_allowed;
+    return on && (*g_skip_allowed);
 }
 
 // The pipeline for a canonical key: built, in flight (waited for, or null under async_skip), or compiled now.
@@ -697,13 +720,18 @@ VkPipeline pipeline_for(const PipelineKey& canon, const ProgramLayout& layout, b
 
 }  // namespace
 
-void pipeline_skip_allowed(bool allowed) { g_skip_allowed = allowed; }
+void pipeline_skip_allowed(bool allowed) { (*g_skip_allowed) = allowed; }
 
 bool fs_reads_fragcoord(const ShaderInfo* fs) {
     static std::map<const ShaderInfo*, bool> memo;
     if (!fs) return false;
+    static PerThread<std::unordered_map<const ShaderInfo*, bool>*> front_pt;  // the thread's own answers, no lock
+    auto*& front = *front_pt;
+    if (!front) front = new std::unordered_map<const ShaderInfo*, bool>();
+    if (auto f = front->find(fs); f != front->end()) return f->second;
+    std::lock_guard lk(cache_mutex());
     auto it = memo.find(fs);
-    if (it != memo.end()) return it->second;
+    if (it != memo.end()) return (*front)[fs] = it->second;
     std::lock_guard module_lock(g_module_lock);
     std::vector<uint32_t> code = patched_spirv(fs, nullptr, 0, nullptr), unused;
     return memo[fs] = patch_fragcoord_scale(code, unused);
@@ -713,10 +741,17 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     // By the key's bytes, as before, but hashed (nvn_pipeline.h) instead of a ~700-byte std::string built and
     // compared down a tree per draw; and the last entry first: consecutive draws mostly share their state.
     static std::unordered_map<PKey, VkPipeline, ByteKeyHash> cache;
-    static const std::pair<const PKey, VkPipeline>* last = nullptr;  // entries are never erased
+    static PerThread<const std::pair<const PKey, VkPipeline>*> last_pt;  // entries are never erased
+    auto& last = *last_pt;
     if (last && std::memcmp(&key, last->first.b, sizeof key) == 0) return last->second;
     PKey k = bytes_of(key);
-    if (auto it = cache.find(k); it != cache.end()) return (last = &*it)->second;
+    // The thread's own copy of the entries it met (the parallel replay's workers: no lock per draw).
+    static PerThread<std::unordered_map<PKey, const std::pair<const PKey, VkPipeline>*, ByteKeyHash>*> front_pt;
+    auto& front = *front_pt;
+    if (!front) front = new std::unordered_map<PKey, const std::pair<const PKey, VkPipeline>*, ByteKeyHash>();
+    if (auto it = front->find(k); it != front->end()) return (last = it->second)->second;
+    std::lock_guard lk(cache_mutex());
+    if (auto it = cache.find(k); it != cache.end()) return (*front)[k] = last = &*it, last->second;
 
     // A new raw key. The same Vulkan pipeline may already exist under another raw key that differs only in state
     // Vulkan ignores (see canonical_key): look it up by its canonical key before compiling.
@@ -746,12 +781,15 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
         note_pipeline_skipped();
         return VK_NULL_HANDLE;  // not remembered: asked again by the next draw
     }
-    return (last = &*cache.emplace(k, p).first)->second;
+    last = &*cache.emplace(k, p).first;
+    (*front)[k] = last;
+    return last->second;
 }
 
 // Once per submit (replay thread): collect finished compiles, and start the pipelines of earlier sessions
 // (pipelines_*.keys) whose shaders the game has loaded by now.
 void pipeline_warm_step() {
+    std::lock_guard lk(cache_mutex());
     adopt_finished();
     g_prewarm_inflight = g_inflight.size();
     static const bool on = [] {
@@ -1119,26 +1157,26 @@ void pipeline_begin_submit() {
     pipeline_warm_step();
 }
 
-uint64_t g_not_ready[6];  // why sampled_ready said no: no image, dirty, texel writes, rendered, not uploaded, layout
+PerThread<uint64_t[6]> g_not_ready;  // why sampled_ready said no: no image, dirty, texel writes, rendered, not uploaded, layout
 
 bool sampled_ready(uint64_t texture) {
     Texture* t = get<Texture>(texture);
-    if (!t || !t->image) return g_not_ready[0]++, false;  // no image yet (missing textures are the caller's)
+    if (!t || !t->image) return (*g_not_ready)[0]++, false;  // no image yet (missing textures are the caller's)
     check_linear_content(*t);
-    if (t->dirty && !t->image->rendered) return g_not_ready[1]++, false;
-    if (t->has_writes.load(std::memory_order_acquire)) return g_not_ready[2]++, false;  // no lock (nvn.h)
+    if (t->dirty && !t->image->rendered) return (*g_not_ready)[1]++, false;
+    if (t->has_writes.load(std::memory_order_acquire)) return (*g_not_ready)[2]++, false;  // no lock (nvn.h)
     const GpuImage& img = *t->image;
     bool ok = img.rendered ? img.layout == VK_IMAGE_LAYOUT_GENERAL
                            : img.uploaded && img.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    if (!ok) g_not_ready[img.rendered ? 3 : !img.uploaded ? 4 : 5]++;
+    if (!ok) (*g_not_ready)[img.rendered ? 3 : !img.uploaded ? 4 : 5]++;
     return ok;
 }
 
 void sampled_ready_log() {
     log("nvn passes: textures not ready: %llu no image, %llu dirty, %llu texel writes, %llu rendered not GENERAL, "
         "%llu not uploaded, %llu uploaded in another layout",
-        (unsigned long long)g_not_ready[0], (unsigned long long)g_not_ready[1], (unsigned long long)g_not_ready[2],
-        (unsigned long long)g_not_ready[3], (unsigned long long)g_not_ready[4], (unsigned long long)g_not_ready[5]);
+        (unsigned long long)(*g_not_ready)[0], (unsigned long long)(*g_not_ready)[1], (unsigned long long)(*g_not_ready)[2],
+        (unsigned long long)(*g_not_ready)[3], (unsigned long long)(*g_not_ready)[4], (unsigned long long)(*g_not_ready)[5]);
 }
 
 VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer, VkFormat format) {
@@ -1149,6 +1187,7 @@ VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer, VkFor
     if (level == 0 && layer == 0 && img.levels == 1 && img.layers == 1 && img.view_type == VK_IMAGE_VIEW_TYPE_2D &&
         format == img.format)
         return img.view;
+    std::lock_guard lk(cache_mutex());
     auto& cache = g_attachment_views;
     auto& v = cache[{img.image, level, layer, format}];
     if (!v) {
@@ -1166,6 +1205,14 @@ GpuImage* ensure_contents(VkCommandBuffer cb, uint64_t texture) {
     Texture* t = get<Texture>(texture);
     GpuImage* img = t ? image_of(texture) : nullptr;
     if (!img) return nullptr;
+    // A parallel replay worker (docs/PARALLEL_REPLAY.md) only samples what needs nothing done: an upload, texel
+    // writes or a first clear are the replay thread's.
+    if ((*t_parallel_worker)) {
+        bool clean = !t->dirty.load(std::memory_order_acquire) && !t->has_writes.load(std::memory_order_acquire) &&
+                     (img->rendered || img->uploaded) && img->layout != VK_IMAGE_LAYOUT_UNDEFINED;
+        if (!clean) worker_bail("texture contents");
+        return img;
+    }
     bool dirty = t->dirty.exchange(false);
     uint64_t dirty_lo = t->dirty_lo.exchange(UINT64_MAX), dirty_hi = t->dirty_hi.exchange(0);
     if (dirty_hi <= dirty_lo) dirty_lo = 0, dirty_hi = UINT64_MAX;  // marked without a range: all of it
@@ -1222,6 +1269,7 @@ VkImageView sampled_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
         return dummy_view(cb, shape);
     }
     *layout = img->rendered ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (img->layout != *layout && worker_bail("sampled layout")) return img->view;  // a layout change: the replay thread's
     transition(cb, *img, *layout);
     // The swizzle belongs to the texture (its builder, or its pool view), not to the image: an image may be shared
     // with or inherited from another texture over the same memory (#36, #42), whose swizzle differs. With the
@@ -1325,6 +1373,7 @@ VkImageView storage_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
 }
 
 void forget_image_views(const GpuImage& img) {
+    std::lock_guard lk(cache_mutex());
     // The caches are ordered by image first: its views are one run from the smallest key with that image (this was
     // a scan of every cached view per destroyed texture, a visible share of the replay time).
     auto drop = [&](auto& cache, auto lowest) {
@@ -1336,8 +1385,7 @@ void forget_image_views(const GpuImage& img) {
     };
     forget_framebuffers(img.view);  // nvn_renderpass.cpp (attachments may use the whole-image view)
     drop(g_sampled_views, std::make_tuple(img.image, VkImageViewType(0), 0u, uint64_t(0), uint64_t(0)));
-    for (ViewHit& h : g_view_hits)
-        if (std::get<0>(h.key) == img.image) h = {};
+    g_views_gen.fetch_add(1, std::memory_order_release);  // every thread's front entries
     drop(g_attachment_views, std::make_tuple(img.image, 0u, 0u, VkFormat(0)));
 }
 
