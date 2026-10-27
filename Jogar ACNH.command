@@ -37,6 +37,10 @@ if [ ! -d private/acnh/mods/ptbr/romfs ]; then
   ptbr=$(ls -t "$HOME"/Downloads/acnh_ptbr*.zip 2>/dev/null | head -1)
   if [ -n "$ptbr" ] && mkdir -p private/acnh/mods/ptbr &&
      unzip -qo "$ptbr" 'romfs/*' -d private/acnh/mods/ptbr 2>/dev/null; then
+    # As the setup installs it: archives as the game reads them, long dialogue lines re-wrapped.
+    python3 -c "import sys; sys.path.insert(0, 'tools'); import setup_acnh as s
+s.fix_archives('private/acnh/mods/ptbr/romfs')
+s.rewrap_messages('private/acnh/extract/romfs', 'private/acnh/mods/ptbr/romfs')"
     echo "pt-BR translation installed ($ptbr)"
   fi
 fi
