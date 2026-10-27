@@ -90,8 +90,12 @@ void window_px(uint64_t present, uint32_t& w, uint32_t& h) {
 // "21:9", "2560x1080", ... k = that aspect over 16:9. video.resolution / NX_RENDER_HEIGHT: "native" (the game's own
 // 1080 rows, 720 in handheld mode), a row count for the 16:9 part of the picture (540 .. 2160), or "window" (the
 // rows the picture takes in the window).
+std::atomic<uint32_t> g_display_rows{0};  // the window's rows when the scale was taken (uw_resize's cap)
+
 Scale wanted(uint64_t present) {
     uint32_t ww = 0, wh = 0;
+    plat::screen_size(ww, wh);  // the display's own rows (Android's window size is the render-scaled one); 0: no cap
+    g_display_rows.store(ww && wh ? std::min(ww, wh) : 0, std::memory_order_relaxed);
     window_px(present, ww, wh);
     const double window = double(ww) / double(wh);
     std::string a = setting("NX_ULTRAWIDE", "video.aspect", "16:9");
@@ -232,6 +236,14 @@ void uw_resize(Texture& t) {
         c = g_current, gen = g_gen.load();
     }
     double sx = double(c.s) * std::max(1.0, double(c.k)), sy = double(c.s) * std::max(1.0, 1.0 / double(c.k));
+    // Never more rows than the screen has: in handheld mode the scale that takes the 720-row targets to the asked
+    // rows (x1.25 for 900) also took the game's 1080-row output to 1350 rows on a 1080-row phone, and the composite,
+    // the frame generation and the present ran at 3000x1350 to be scaled down again. NX_UW_CAP=0: as before.
+    static const bool cap = !(std::getenv("NX_UW_CAP") && std::getenv("NX_UW_CAP")[0] == '0');
+    if (const uint32_t rows = g_display_rows.load(std::memory_order_relaxed); cap && rows >= 240 && t.base_h * sy > rows) {
+        const double f = double(rows) / (double(t.base_h) * sy);
+        sx *= f, sy *= f;
+    }
     t.width = std::max(1u, uint32_t(std::lround(t.base_w * sx)));
     t.height = std::max(1u, uint32_t(std::lround(t.base_h * sy)));
     t.uw_gen = gen;
