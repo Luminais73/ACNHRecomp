@@ -95,6 +95,9 @@ int live_trace_cmds() {
 
 // One command as replay_list replays it, CallList apart (nvn_parallel.cpp replays a flattened frame with it).
 void replay_cmd(VkCommandBuffer& cb, Targets& st, const Cmd& c, const CmdList& list) {
+    if (c.op == Cmd::SetRenderTargets || c.op == Cmd::CopyTextureToTexture || c.op == Cmd::CopyBufferToTexture ||
+        c.op == Cmd::CopyTextureToBuffer)
+        (*replay::g_state_gen)++;
     switch (c.op) {
         case Cmd::SetRenderTargets: {  // the pass ends only when a draw or clear needs other targets
             static const bool always = std::getenv("NX_TARGETS_BREAK") != nullptr;  // bisecting: the old way

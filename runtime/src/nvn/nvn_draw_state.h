@@ -51,7 +51,12 @@ struct Stats {
     uint64_t breaks_textures = 0, breaks_targets = 0;  // render passes ended by a draw: uploads/layouts, new targets
 };
 
-extern PerThread<State> g_state;  // per replaying thread (docs/PARALLEL_REPLAY.md)
+extern PerThread<State> g_state;
+// Bumped by every command that may change what a draw resolves to (program, textures, images, fixed-function state,
+// targets, pools, anything that writes images); not by data (uniform, storage and vertex buffer bindings, uniform
+// updates, viewport and scissor). Equal between two draws: the second may reuse the first's resolution (draw()'s fast
+// path, docs/PARALLEL_REPLAY.md "Draw fast path").
+extern PerThread<uint64_t> g_state_gen;  // per replaying thread (docs/PARALLEL_REPLAY.md)
 extern PerThread<Stats> g_stats;
 
 const uint8_t* guest_bytes(uint64_t gpu);
@@ -137,6 +142,11 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders);
 void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shaders, const ProgramLayout& layout);
 // vkUpdateDescriptorSets for what build_sets made, then the sets bound at `point`.
 void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayout& layout);
+// The draw fast path (nvn_draw.cpp): the next build_sets/bind_sets keep this texture set (set 2) instead of building
+// it; and set 2 as the last bind_sets resolved it.
+void sets_keep_texture_set(VkDescriptorSet set);
+VkDescriptorSet sets_texture_set();
+bool sets_cache_enabled();  // NX_SET_CACHE (the fast path needs it)
 Upload zero_stream();  // 64 zero bytes for vertex binding 15
 // draw_inputs, with 16- and 32-bit indices through dedup_upload.
 bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in);

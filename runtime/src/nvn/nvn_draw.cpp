@@ -26,6 +26,7 @@ namespace replay {
 // Per replaying thread: the replay thread's, and each parallel replay worker's own (docs/PARALLEL_REPLAY.md).
 PerThread<State> g_state;
 PerThread<Stats> g_stats;
+PerThread<uint64_t> g_state_gen;
 
 const uint8_t* guest_bytes(uint64_t gpu) {
     uint64_t off = 0;
@@ -306,9 +307,180 @@ void draw_part(int k) {
 }
 namespace {
 
+// The end of a draw, shared by the full path and the fast path: vertex buffers, viewport and scissor (scaled to a
+// screen target), the draw itself, and what it wrote.
+void draw_issue(VkCommandBuffer cb, const Targets& t, bool indexed, const Cmd& c, const DrawInputs& in,
+                const ShaderInfo* vs, const ShaderInfo* fs, float ui_x) {
+    // The vertex buffers resolved above, plus the zero stream (binding 15).
+    for (uint32_t s = 0; s < 15; s++)
+        if (in.used >> s & 1) bind_vertex(cb, s, in.vertex[s]);
+    bind_vertex(cb, 15, zero_stream());
+
+    VkViewport vp{0, 0, float((*g_pass_extent).width), float((*g_pass_extent).height), 0, 1};
+    if ((*g_state).has_viewport)
+        vp = {float((*g_state).viewport[0]), float((*g_state).viewport[1]), float((*g_state).viewport[2]),
+              float((*g_state).viewport[3]), (*g_state).depth_near, (*g_state).depth_far};
+    // NVN's upper-left window origin (what Wonder sets) maps NDC +Y to the top of the render target, like D3D;
+    // Vulkan maps it to the bottom. A negative-height viewport gives NVN's mapping, and with it NVN's front faces.
+    // (Before this, the front face was inverted instead: triangles were culled right, but every render target was
+    // upside down, which the post chain undid in some scenes and not in others: the first course showed a
+    // mirrored sky.)
+    VkRect2D sc{{0, 0}, (*g_pass_extent)};
+    if ((*g_state).has_scissor)
+        sc = {{std::max(0, (*g_state).scissor[0]), std::max(0, (*g_state).scissor[1])},
+              {uint32_t(std::max(0, (*g_state).scissor[2])), uint32_t(std::max(0, (*g_state).scissor[3]))}};
+    if ((*g_uw).on) {  // the guest's pixel spans, scaled
+        if ((*g_state).has_viewport) {
+            int32_t x = int32_t(vp.x), w = int32_t(vp.width), y = int32_t(vp.y), h = int32_t(vp.height);
+            uw_span(x, w, (*g_pass_extent).width, (*g_uw).sx);
+            uw_span(y, h, (*g_pass_extent).height, (*g_uw).sy);
+            vp.x = float(x), vp.width = float(w), vp.y = float(y), vp.height = float(h);
+        }
+        if ((*g_state).has_scissor) {
+            int32_t x = sc.offset.x, w = int32_t(sc.extent.width), y = sc.offset.y, h = int32_t(sc.extent.height);
+            // A squeezed UI draw's scissor (a clipped list, the birthday wheel) follows its geometry: along the squeezed
+            // axis the guest's span is taken about the middle of the target, at the resolution part of the scale.
+            auto squeezed = [](int32_t& p, int32_t& n, uint32_t extent, float f, float s) {
+                const double guest = double(extent) / f;
+                if (p <= 0 && double(p) + n >= guest - 1.0) {  // all of it
+                    p = 0, n = int32_t(extent);
+                    return;
+                }
+                double p0 = (double(p) - guest * 0.5) * s + extent * 0.5, p1 = p0 + double(n) * s;
+                p0 = std::clamp(p0, 0.0, double(extent)), p1 = std::clamp(p1, 0.0, double(extent));
+                p = int32_t(std::lround(p0)), n = int32_t(std::lround(p1 - p0));
+            };
+            if (ui_x > 0) squeezed(x, w, (*g_pass_extent).width, (*g_uw).sx, (*g_uw).s());
+            else uw_span(x, w, (*g_pass_extent).width, (*g_uw).sx);
+            if (ui_x < 0) squeezed(y, h, (*g_pass_extent).height, (*g_uw).sy, (*g_uw).s());
+            else uw_span(y, h, (*g_pass_extent).height, (*g_uw).sy);
+            sc.offset.x = x, sc.extent.width = uint32_t(w), sc.offset.y = y, sc.extent.height = uint32_t(h);
+        }
+    }
+    vp.y += vp.height, vp.height = -vp.height;
+    set_dynamic(cb, vp, sc);
+
+    trace_skin(indexed, c, vs, fs);
+    if (gpu_profile_draws()) {
+        char label[128];
+        std::snprintf(label, sizeof label, "  draw vs %s fs %s n%d x%d", vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
+                      indexed ? c.i[0] : c.i[1], std::max(1, c.i[3]));
+        gpu_profile_mark(cb, label);
+    }
+    if (indexed) {
+        uint32_t count = uint32_t(c.i[0]);
+        if ((*g_bound).has_index && (*g_bound).index.buffer == in.index.buffer && (*g_bound).index.offset == in.index.offset &&
+            (*g_bound).index_type == in.index_type) {
+            (*g_state_kept)++;
+        } else {
+            p_vkCmdBindIndexBuffer(cb, in.index.buffer, in.index.offset, in.index_type);
+            (*g_bound).has_index = true, (*g_bound).index = in.index, (*g_bound).index_type = in.index_type, (*g_state_set)++;
+        }
+        bool q = zero_draws_on() && zero_draws_begin(cb, vs->hash + " " + (fs ? fs->hash : std::string("-")));
+        p_vkCmdDrawIndexed(cb, count, uint32_t(std::max(1, c.i[3])), 0, c.i[1], uint32_t(c.i[2]));
+        if (q) zero_draws_end(cb);
+    } else {
+        bool q = zero_draws_on() && zero_draws_begin(cb, vs->hash + " " + (fs ? fs->hash : std::string("-")));
+        p_vkCmdDraw(cb, uint32_t(c.i[1]), uint32_t(std::max(1, c.i[3])), uint32_t(c.i[0]), uint32_t(c.i[2]));
+        if (q) zero_draws_end(cb);
+    }
+    (*g_stats).done++;
+    (*g_pass_written) |= ((1u << t.color_count) - 1) | ((*g_state).depth.depth_write || (*g_state).depth.stencil_test ? 1u << 8 : 0);
+}
+
+// The draw fast path (docs/PARALLEL_REPLAY.md, after Wind Waker HD's port): a draw whose state generation
+// (g_state_gen: nothing but data changed since), targets, command buffer and open pass are the last full draw's reuses
+// what that draw resolved: program, layout, textures (their set 2), pipeline, screen-scale decisions. Only the data is
+// done again: uniform and storage buffers (sets 0-1), vertex and index data, viewport and scissor. ~86% of the island's
+// draws at noon. Checked on each use: the sampled textures unchanged (not written by the CPU, same image), the texture
+// handles read from uniform buffers the same, the screen scale's generation. NX_FAST_DRAW=0: off.
+struct Prepared {
+    bool valid = false;
+    uint64_t gen = 0, uw_gen = 0;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    Targets t{}, tt{};
+    uint32_t mode = 0;
+    const std::vector<const ShaderInfo*>* shaders = nullptr;
+    const ShaderInfo *vs = nullptr, *fs = nullptr;
+    const ProgramLayout* layout = nullptr;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorSet set2 = VK_NULL_HANDLE;
+    float ui_x = 0;
+    struct Tex {
+        Texture* tex;
+        GpuImage* img;
+    };
+    std::vector<Tex> textures;
+    struct Handle {
+        int stage, bank;
+        uint32_t word;
+        uint64_t value;
+    };
+    std::vector<Handle> handles;
+};
+PerThread<Prepared> g_prep;
+PerThread<uint64_t> g_fast_hits, g_fast_misses;
+
+bool fast_draw_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_FAST_DRAW");
+        if (e && e[0] == '0') return false;
+        // Debug features that work per draw (snapshots, traces, overrides) need the full path.
+        for (const char* v : {"NX_SNAP_FS", "NX_SNAP_FS_BEFORE", "NX_SNAP_FOLLOW", "NX_DUMP_ON_FS", "NX_DUMP_ON_TARGET",
+                              "NX_DUMP_DRAW_TEXTURES", "NX_TRACE_DRAWS", "NX_DRAW_SLOW", "NX_PASS_BARRIER_NARROW",
+                              "NX_SWAP_FS", "NX_SKIP_FS", "NX_UW_TRACE", "NX_DRAW_TIMING", "NX_TRACE_SKIN"})
+            if (const char* x = std::getenv(v); x && *x) return false;
+        return sets_cache_enabled();
+    }();
+    return on && !gpu_profile_draws() && !zero_draws_on();
+}
+
+// Whether the prepared draw still holds (the generation and the targets compared by the caller).
+bool prepared_holds(const Prepared& p) {
+    if (p.uw_gen != uw_generation()) return false;
+    for (const Prepared::Tex& x : p.textures)
+        if (x.tex->dirty.load(std::memory_order_acquire) || x.tex->has_writes.load(std::memory_order_acquire) ||
+            x.tex->image.get() != x.img)
+            return false;
+    for (const Prepared::Handle& h : p.handles) {
+        const Range& r = (*g_state).uniforms[h.stage][h.bank];
+        const uint8_t* q = r.address ? guest_bytes(r.address) : nullptr;
+        uint64_t v = q && uint64_t(h.word) * 4 + 4 <= r.size ? *reinterpret_cast<const uint32_t*>(q + h.word * 4) : 0;
+        if (v != h.value) return false;
+    }
+    return true;
+}
+
 bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c) {
     (*g_stats).total++;
     if ((*g_state).rasterizer_discard || !(*g_state).render_enable) return false;  // nothing reaches the targets
+    Prepared& prep = *g_prep;
+    if (prep.valid && prep.gen == *g_state_gen && prep.cb == cb && prep.mode == mode && *g_rendering &&
+        targets_same(prep.t, t) && fast_draw_on() && prepared_holds(prep)) {
+        (*g_fast_hits)++;
+        sets_keep_texture_set(prep.set2);
+        build_sets(cb, *prep.shaders, *prep.layout);
+        if (*t_bail) return false;
+        DrawInputs in;
+        if (!draw_inputs_shared(cb, prep.vs, indexed, c, in)) {
+            (*g_stats).no_indices++;
+            return false;
+        }
+        if (*t_bail) return false;
+        if (!*g_rendering) begin_rendering(cb, prep.tt);  // a written range's copy ended the pass
+        if (*t_bail) return false;
+        if ((*g_bound).cb != cb) (*g_bound) = Bound{}, (*g_bound_gen)++, (*g_bound).cb = cb;
+        if ((*g_bound).pipeline != prep.pipeline) {
+            p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, prep.pipeline);
+            (*g_bound).pipeline = prep.pipeline, (*g_state_set)++;
+        }
+        bind_sets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, *prep.layout);
+        draw_issue(cb, t, indexed, c, in, prep.vs, prep.fs, prep.ui_x);
+        return true;
+    }
+    (*g_fast_misses)++;
+    prep.valid = false;
+    bool data_dep = false;  // the draw's resolution read vertex data (a UI quad's size): not prepared for the next
     const auto* shaders = program_shaders((*g_state).program);
     if (!shaders || shaders->empty()) {
         (*g_stats).no_program++;
@@ -542,6 +714,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     // as a dark band beside the phone. Its first vertices decide (positions within +-0.5).
     if (aniso && cam_patch && ui_pick && key.uw_x == 0 && !uw_vs_scaled(vs) && !(*g_state).attribs.empty() &&
         !(*g_state).streams.empty()) {
+        data_dep = true;
         const VertexAttrib& a = (*g_state).attribs[0];
         const uint32_t stride = a.stream < (*g_state).streams.size() ? (*g_state).streams[a.stream].stride : 0;
         const Range& vb = (*g_state).vertex_buffers[a.stream < 16 ? a.stream : 0];
@@ -630,81 +803,43 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     bind_sets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout);
     draw_part(4);
 
-    // The vertex buffers resolved above, plus the zero stream (binding 15).
-    for (uint32_t s = 0; s < 15; s++)
-        if (in.used >> s & 1) bind_vertex(cb, s, in.vertex[s]);
-    bind_vertex(cb, 15, zero_stream());
-
-    VkViewport vp{0, 0, float((*g_pass_extent).width), float((*g_pass_extent).height), 0, 1};
-    if ((*g_state).has_viewport)
-        vp = {float((*g_state).viewport[0]), float((*g_state).viewport[1]), float((*g_state).viewport[2]),
-              float((*g_state).viewport[3]), (*g_state).depth_near, (*g_state).depth_far};
-    // NVN's upper-left window origin (what Wonder sets) maps NDC +Y to the top of the render target, like D3D;
-    // Vulkan maps it to the bottom. A negative-height viewport gives NVN's mapping, and with it NVN's front faces.
-    // (Before this, the front face was inverted instead: triangles were culled right, but every render target was
-    // upside down, which the post chain undid in some scenes and not in others: the first course showed a
-    // mirrored sky.)
-    VkRect2D sc{{0, 0}, (*g_pass_extent)};
-    if ((*g_state).has_scissor)
-        sc = {{std::max(0, (*g_state).scissor[0]), std::max(0, (*g_state).scissor[1])},
-              {uint32_t(std::max(0, (*g_state).scissor[2])), uint32_t(std::max(0, (*g_state).scissor[3]))}};
-    if ((*g_uw).on) {  // the guest's pixel spans, scaled
-        if ((*g_state).has_viewport) {
-            int32_t x = int32_t(vp.x), w = int32_t(vp.width), y = int32_t(vp.y), h = int32_t(vp.height);
-            uw_span(x, w, (*g_pass_extent).width, (*g_uw).sx);
-            uw_span(y, h, (*g_pass_extent).height, (*g_uw).sy);
-            vp.x = float(x), vp.width = float(w), vp.y = float(y), vp.height = float(h);
-        }
-        if ((*g_state).has_scissor) {
-            int32_t x = sc.offset.x, w = int32_t(sc.extent.width), y = sc.offset.y, h = int32_t(sc.extent.height);
-            // A squeezed UI draw's scissor (a clipped list, the birthday wheel) follows its geometry: along the squeezed
-            // axis the guest's span is taken about the middle of the target, at the resolution part of the scale.
-            auto squeezed = [](int32_t& p, int32_t& n, uint32_t extent, float f, float s) {
-                const double guest = double(extent) / f;
-                if (p <= 0 && double(p) + n >= guest - 1.0) {  // all of it
-                    p = 0, n = int32_t(extent);
-                    return;
+    draw_issue(cb, t, indexed, c, in, vs, fs, ui_x);
+    // Prepared for the next draws of the same state (the fast path above). Not when anything here was pending
+    // (uploads, layout changes, a sampled target of this pass, pending clears) or debug overrides changed the shaders.
+    if (!gathered && !data_dep && swapped.empty() && *g_rendering && !*t_bail && fast_draw_on()) {
+        prep.valid = true;
+        prep.gen = *g_state_gen, prep.uw_gen = uw_generation(), prep.cb = cb, prep.mode = mode;
+        prep.t = t, prep.tt = tt;
+        prep.shaders = shaders, prep.vs = vs, prep.fs = fs, prep.layout = &layout, prep.pipeline = pipeline;
+        prep.set2 = sets_texture_set();
+        prep.ui_x = ui_x;
+        prep.textures.clear(), prep.handles.clear();
+        const DrawTextures& dt = *g_textures;
+        for (size_t k = 0; k < dt.resolved.size(); k++) {
+            const ResolvedTexture& r = dt.resolved[k];
+            if (r.texture) {
+                Texture* tx = get<Texture>(r.texture);
+                GpuImage* img = tx ? image_of(r.texture) : nullptr;
+                if (!tx || !img) {
+                    prep.valid = false;
+                    break;
                 }
-                double p0 = (double(p) - guest * 0.5) * s + extent * 0.5, p1 = p0 + double(n) * s;
-                p0 = std::clamp(p0, 0.0, double(extent)), p1 = std::clamp(p1, 0.0, double(extent));
-                p = int32_t(std::lround(p0)), n = int32_t(std::lround(p1 - p0));
-            };
-            if (ui_x > 0) squeezed(x, w, (*g_pass_extent).width, (*g_uw).sx, (*g_uw).s());
-            else uw_span(x, w, (*g_pass_extent).width, (*g_uw).sx);
-            if (ui_x < 0) squeezed(y, h, (*g_pass_extent).height, (*g_uw).sy, (*g_uw).s());
-            else uw_span(y, h, (*g_pass_extent).height, (*g_uw).sy);
-            sc.offset.x = x, sc.extent.width = uint32_t(w), sc.offset.y = y, sc.extent.height = uint32_t(h);
+                // A sampled image this pass renders to: the next draw may need the pass broken (pass_wrote).
+                for (uint32_t i = 0; i < 9; i++)
+                    if ((*g_pass_images)[i] == img) prep.valid = false;
+                prep.textures.push_back({tx, img});
+            }
+            if (k < dt.bindings.size()) {
+                const DescriptorBinding* b = dt.bindings[k].second;
+                if (b->nvn.source == NvnSource::HandleInUniform && b->nvn.bank >= 3) {
+                    const ShaderStage sg = dt.bindings[k].first->stage;  // nvn_sets.cpp's api_stage
+                    prep.handles.push_back({sg == ShaderStage::Fragment ? 1 : sg == ShaderStage::Compute ? 5 : 0,
+                                            b->nvn.bank - 3, uint32_t(b->nvn.word), k < dt.handles.size() ? dt.handles[k] : 0});
+                }
+            }
         }
+        if (!prep.set2 && !dt.bindings.empty()) prep.valid = false;
     }
-    vp.y += vp.height, vp.height = -vp.height;
-    set_dynamic(cb, vp, sc);
-
-    trace_skin(indexed, c, vs, fs);
-    if (gpu_profile_draws()) {
-        char label[128];
-        std::snprintf(label, sizeof label, "  draw vs %s fs %s n%d x%d", vs->hash.c_str(), fs ? fs->hash.c_str() : "-",
-                      indexed ? c.i[0] : c.i[1], std::max(1, c.i[3]));
-        gpu_profile_mark(cb, label);
-    }
-    if (indexed) {
-        uint32_t count = uint32_t(c.i[0]);
-        if ((*g_bound).has_index && (*g_bound).index.buffer == in.index.buffer && (*g_bound).index.offset == in.index.offset &&
-            (*g_bound).index_type == in.index_type) {
-            (*g_state_kept)++;
-        } else {
-            p_vkCmdBindIndexBuffer(cb, in.index.buffer, in.index.offset, in.index_type);
-            (*g_bound).has_index = true, (*g_bound).index = in.index, (*g_bound).index_type = in.index_type, (*g_state_set)++;
-        }
-        bool q = zero_draws_on() && zero_draws_begin(cb, vs->hash + " " + (fs ? fs->hash : std::string("-")));
-        p_vkCmdDrawIndexed(cb, count, uint32_t(std::max(1, c.i[3])), 0, c.i[1], uint32_t(c.i[2]));
-        if (q) zero_draws_end(cb);
-    } else {
-        bool q = zero_draws_on() && zero_draws_begin(cb, vs->hash + " " + (fs ? fs->hash : std::string("-")));
-        p_vkCmdDraw(cb, uint32_t(c.i[1]), uint32_t(std::max(1, c.i[3])), uint32_t(c.i[0]), uint32_t(c.i[2]));
-        if (q) zero_draws_end(cb);
-    }
-    (*g_stats).done++;
-    (*g_pass_written) |= ((1u << t.color_count) - 1) | ((*g_state).depth.depth_write || (*g_state).depth.stencil_test ? 1u << 8 : 0);
     // NX_SNAP_FS=<hash>,<hash>[@<first draw>]: also snapshot after draws with those fragment shaders (8 at most, or
     // NX_SNAP_FS_MAX).
     static const std::string snap_fs = std::getenv("NX_SNAP_FS") ? std::getenv("NX_SNAP_FS") : "";
@@ -786,6 +921,11 @@ void draw_begin_submit() {
 uint64_t recorded_draws();
 
 void draw_log_stats() {
+    if (*g_fast_hits + *g_fast_misses)
+        log("nvn: draw fast path: %llu of %llu draws (%.1f%%)", (unsigned long long)*g_fast_hits,
+            (unsigned long long)(*g_fast_hits + *g_fast_misses),
+            100.0 * double(*g_fast_hits) / double(*g_fast_hits + *g_fast_misses));
+    *g_fast_hits = *g_fast_misses = 0;
     if ((*g_vertex_barriers)) log("nvn passes: %llu vertex-read barriers (G4)", (unsigned long long)(*g_vertex_barriers));
     dedup_log();
     render_pass_log();

@@ -397,9 +397,17 @@ uint64_t handle_bits(H h) {
 }
 
 // d.sets from the cache or newly made, the writes of the cached ones dropped and the rest pointed at their new sets.
+// The draw fast path's texture set (nvn_draw.cpp): set 2 as the previous draw of the same state made it, its writes
+// not built again. Consumed by bind_sets.
+PerThread<VkDescriptorSet> g_keep_set2;
+
 void resolve_sets(const ProgramLayout& layout) {
     Descriptors& d = (*g_sets);
     for (uint32_t k = 0; k < 4; k++) {
+        if (k == 2 && *g_keep_set2) {
+            d.sets[2] = *g_keep_set2;
+            continue;
+        }
         d.key.clear();
         uint64_t h = handle_bits(layout.sets[k]) * 0x9E3779B97F4A7C15ull;
         for (size_t i = 0; i < d.writes.size(); i++) {
@@ -628,6 +636,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
         }
     }
     draw_part(6);
+    if (*g_keep_set2) return;  // the fast path: set 2 kept, no storage images (it is not taken with them)
     const DrawTextures& t = (*g_textures);
     for (size_t k = 0; k < t.bindings.size(); k++) {
         auto [s, b] = t.bindings[k];
@@ -676,9 +685,14 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
 // A set with no binding in the layout is statically used by no shader, so nothing need be bound there: the runs of
 // sets build_sets allocated are bound, in ascending order (each bind leaves the lower sets, bound with this same
 // layout, undisturbed).
+bool sets_cache_enabled() { return set_cache_on(); }
+void sets_keep_texture_set(VkDescriptorSet set) { *g_keep_set2 = set; }
+VkDescriptorSet sets_texture_set() { return (*g_sets).sets[2]; }
+
 void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayout& layout) {
     Descriptors& d = (*g_sets);
     if (set_cache_on()) resolve_sets(layout);
+    *g_keep_set2 = VK_NULL_HANDLE;
     draw_part(8);
     if (!d.writes.empty()) p_vkUpdateDescriptorSets(vk_device(), uint32_t(d.writes.size()), d.writes.data(), 0, nullptr);
     draw_part(9);

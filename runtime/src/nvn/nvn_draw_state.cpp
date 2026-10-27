@@ -13,6 +13,21 @@ using namespace replay;
 
 void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets) {
     State& s = (*g_state);
+    switch (c.op) {  // data only: the draws' resolution stays (g_state_gen)
+        case Cmd::SetViewport:
+        case Cmd::SetScissor:
+        case Cmd::BindUniformBuffer:
+        case Cmd::BindStorageBuffer:
+        case Cmd::BindVertexBuffer:
+        case Cmd::UpdateUniformBuffer:
+        case Cmd::ReportCounter:
+        case Cmd::DrawArrays:
+        case Cmd::DrawElements: break;
+        case Cmd::BindDeferred:
+            if (c.mask <= 1) (*g_state_gen)++;  // textures, images (2, 3: uniform and storage buffers)
+            break;
+        default: (*g_state_gen)++; break;
+    }
     auto blob = [&](size_t size) -> const uint8_t* {
         return c.blob < list.blobs.size() && list.blobs[c.blob].size() >= size ? list.blobs[c.blob].data() : nullptr;
     };
