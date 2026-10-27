@@ -219,6 +219,57 @@ bool read_whole(const std::string& path, std::string& out) {
     return ok;
 }
 
+// spirv.pak (tools/pack_spirv.py): the spirv folder's .spv files in one file, opened once. On Android the data folder
+// is on shared storage (FUSE), where opening each of ~9,000 small files took milliseconds: shaders met for the first
+// time while playing stalled the replay. Header "SPK1", the count, then per file 16 bytes of hash, its offset and
+// size (u64 each), then the data. A .spv missing from it is read from the folder.
+struct SpirvPak {
+    FILE* f = nullptr;
+    std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> at;
+};
+SpirvPak& spirv_pak() {
+    static SpirvPak p = [] {
+        SpirvPak x;
+        const std::string path = plat::data_root() + "/spirv.pak";
+        FILE* f = plat::fopen_utf8(path, "rb");
+        if (!f) return x;
+        uint32_t head[2] = {};
+        if (std::fread(head, 4, 2, f) != 2 || head[0] != 0x314b5053 /* SPK1 */ || head[1] > 1u << 20) {
+            std::fclose(f);
+            log("nvn: %s: not a SPIR-V pack", path.c_str());
+            return x;
+        }
+        std::vector<uint8_t> index(size_t(head[1]) * 32);
+        if (std::fread(index.data(), 1, index.size(), f) != index.size()) {
+            std::fclose(f);
+            return x;
+        }
+        for (uint32_t k = 0; k < head[1]; k++) {
+            const uint8_t* e = index.data() + size_t(k) * 32;
+            uint64_t off, size;
+            std::memcpy(&off, e + 16, 8), std::memcpy(&size, e + 24, 8);
+            x.at.emplace(std::string(reinterpret_cast<const char*>(e), strnlen(reinterpret_cast<const char*>(e), 16)),
+                         std::make_pair(off, size));
+        }
+        x.f = f;
+        log("nvn: %zu shaders in %s", x.at.size(), path.c_str());
+        return x;
+    }();
+    return p;
+}
+
+// A shader's .spv: from spirv.pak, else from the spirv folder.
+bool read_spirv(const std::string& hash, std::string& out) {
+    SpirvPak& p = spirv_pak();
+    if (p.f) {
+        if (auto it = p.at.find(hash); it != p.at.end()) {
+            out.resize(size_t(it->second.second));
+            if (plat::read_at(p.f, it->second.first, out.data(), out.size()) == out.size()) return true;
+        }
+    }
+    return read_whole(plat::data_root() + "/spirv/" + hash + ".spv", out);
+}
+
 struct Cache {
     std::mutex lock;
     std::unordered_map<std::string, std::unique_ptr<ShaderInfo>> by_hash;  // null: no usable .spv (logged once)
@@ -266,7 +317,7 @@ const ShaderInfo* shader_for(uint64_t code_host, uint64_t control) {
     }
     std::unique_ptr<ShaderInfo>& slot = k.by_hash[hash];
     std::string bytes;
-    if (!read_whole(dir + hash + ".spv", bytes) || bytes.size() % 4 || bytes.empty()) {
+    if (!read_spirv(hash, bytes) || bytes.size() % 4 || bytes.empty()) {
         log("nvn: shader %s (code %#x bytes, control %llx): no %s%s.spv", hash.c_str(), c.code_size,
             (unsigned long long)control, dir.c_str(), hash.c_str());
         if (std::getenv("NX_DUMP_SHADER_MISSES")) {  // for translating shaders the offline inventory missed
@@ -312,7 +363,7 @@ std::vector<uint32_t> shader_spirv(const ShaderInfo* s) {
     if (!s->spirv.empty()) return s->spirv;
     std::string bytes;
     std::vector<uint32_t> words;
-    if (read_whole(plat::data_root() + "/spirv/" + s->hash + ".spv", bytes) && bytes.size() % 4 == 0) {
+    if (read_spirv(s->hash, bytes) && bytes.size() % 4 == 0) {
         words.resize(bytes.size() / 4);
         std::memcpy(words.data(), bytes.data(), bytes.size());
     } else {

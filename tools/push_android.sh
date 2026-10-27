@@ -26,6 +26,14 @@ for d in analysis spirv fonts exefs mods aoc; do
   echo "== $d ($local_n files)"
   adb push "$SRC/$d" "$D/" | tail -1
 done
+# The shaders also as one file (tools/pack_spirv.py): opening each .spv on the phone's shared storage took
+# milliseconds. Re-sent when the folder changed.
+if [ -d "$SRC/spirv" ]; then
+  python3 tools/pack_spirv.py "$SRC/spirv" "$SRC/spirv.pak"
+  local_s=$(stat -f %z "$SRC/spirv.pak" 2>/dev/null || stat -c %s "$SRC/spirv.pak")
+  phone_s=$(adb shell "stat -c %s $D/spirv.pak 2>/dev/null || echo 0" | tr -d '\r')
+  if [ "$local_s" != "$phone_s" ]; then adb push "$SRC/spirv.pak" "$D/" | tail -1; else echo "== spirv.pak: already there"; fi
+fi
 for f in config.ini language.txt users.txt; do [ -f "$SRC/$f" ] && adb push "$SRC/$f" "$D/" | tail -1; done
 
 [ "$1" = --skip-romfs ] && exit 0

@@ -638,6 +638,11 @@ bool g_skip_allowed = true;
 bool async_skip() {
     static const bool on = [] {
         const char* e = std::getenv("NX_ASYNC_PIPELINES");
+#if defined(__ANDROID__)
+        // On by default on Android: Turnip takes 50-300 ms per new pipeline on a Snapdragon 865, and a walk over the
+        // island from an empty cache froze 27 times (13 with it on; objects show a few frames late instead).
+        if (!e) return pool().threads > 0;
+#endif
         return e && e[0] == '1' && pool().threads > 0;
     }();
     return on && g_skip_allowed;

@@ -113,8 +113,9 @@ void root_clocks() {
         log("root clocks: on (NX_ROOT_CLOCKS=1): the GPU's top clock kept available");
         const char* cmd =
             "G=/sys/kernel/gpu; K=/sys/class/kgsl/kgsl-3d0; "
-            "if [ -w $G/gpu_max_clock ] && [ -r $K/max_clock_mhz ]; then "
-            "m=$(cat $K/max_clock_mhz); [ \"$(cat $G/gpu_max_clock)\" = \"$m\" ] || echo $m > $G/gpu_max_clock; fi\n";
+            "if [ -w $G/gpu_max_clock ] && [ -r $K/gpu_available_frequencies ]; then "
+            "m=0; for f in $(cat $K/gpu_available_frequencies); do [ $f -gt $m ] && m=$f; done; m=$((m / 1000000)); "
+            "[ \"$(cat $G/gpu_max_clock)\" = \"$m\" ] || echo $m > $G/gpu_max_clock; fi\n";
         for (;;) {
             if (std::fputs(cmd, su) < 0 || std::fflush(su) != 0) {
                 log("root clocks: the root shell ended");

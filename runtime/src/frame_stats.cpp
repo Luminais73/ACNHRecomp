@@ -5,7 +5,7 @@
 //
 // NX_AFFINITY (Android): 1 puts the thread that replays and presents on the fastest cluster and the game's main
 // thread on the middle ones; 2 puts both on everything but the slowest cluster. Re-applied every 60 ticks (Android
-// moves an app's threads between cpusets). Unset or 0: the scheduler decides, as before.
+// moves an app's threads between cpusets). Unset: 1. 0: the scheduler decides.
 #include <atomic>
 #include <algorithm>
 #include <cstdint>
@@ -87,9 +87,11 @@ const Cpus& cpus() {
 }
 
 int affinity_mode() {
+    // 1 by default: on the S20 FE's island 595 of 600 game frames came 31-36 ms apart (422 with the scheduler
+    // placing the threads, the rest 25-31 and 36-50 ms).
     static const int m = [] {
         const char* e = std::getenv("NX_AFFINITY");
-        return e ? std::atoi(e) : 0;
+        return e ? std::atoi(e) : 1;
     }();
     return m;
 }

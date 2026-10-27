@@ -62,6 +62,7 @@ struct Mapping {
 
 std::string same(const std::string& v) { return v; }
 std::string on_off(const std::string& v) { return v == "1" || v == "on" || v == "true" ? "1" : ""; }
+std::string on_or_zero(const std::string& v) { return v.empty() ? "" : on_off(v).empty() ? "0" : "1"; }  // off says so
 std::string off_is_zero(const std::string& v) { return v == "0" || v == "off" || v == "false" ? "0" : ""; }
 std::string auto_empty(const std::string& v) { return v == "auto" ? "" : v; }
 std::string off_empty(const std::string& v) { return v == "off" ? "" : v; }
@@ -113,7 +114,7 @@ const Mapping kMappings[] = {
     {"video.frame_rate", "NX_SPEEDFIX", speedfix, true},
     {"video.frame_cap", "NX_FPS_CAP", fps_cap, true},
     {"video.frame_gen", "NX_FRAMEGEN", framegen, true},
-    {"video.async_shaders", "NX_ASYNC_PIPELINES", on_off, true},
+    {"video.async_shaders", "NX_ASYNC_PIPELINES", on_or_zero, true},  // on by default on Android
     {"video.vsync", "NX_VSYNC", off_is_zero, true},
     {"video.shader_prepare", "NX_PIPE_PREWARM", off_is_zero, true},
     {"audio.reverb", "NX_AUDIO_REVERB", off_is_zero, false},  // also read live (hle_audio.cpp)
