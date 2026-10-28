@@ -346,6 +346,26 @@ VkDescriptorBufferInfo buffer_of(VkCommandBuffer cb, const void* bytes, uint64_t
     return {u.buffer, u.offset, n};
 }
 
+}  // namespace
+
+// A uniform block binding's buffer, from the bound range (build_sets; draw merging's run continuation, nvn_draw.cpp).
+VkDescriptorBufferInfo uniform_info(VkCommandBuffer cb, const ShaderInfo* s, const DescriptorBinding& b, const Range& r) {
+    const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
+    // Reads past the bound size return 0 on Maxwell and garbage on Metal (a UI shader read c3[10] of a 0x90-byte
+    // block and wrote Inf): the bound data goes in a zero-padded 4 KB at least. Banks the shader indexes with a
+    // computed value (clamped to 64 KB, nvn_spirv_patch.cpp): all 64 KB, so every read past the data returns 0 as on
+    // Maxwell.
+    bool indexed = b.set == 0 && b.binding < 64 && (dynamic_uniform_bindings(s) >> b.binding & 1);
+    // As far as the shader reads with constant indices when that is known (uniform_read_extents).
+    const uint32_t reads = b.nvn.source == NvnSource::UniformBlock && !indexed && b.set == 0 && b.binding < 64 &&
+                                   s->masks_known
+                               ? s->uniform_extent[b.binding] : 0;
+    return buffer_of(cb, p, p ? std::min<uint64_t>(r.size, 0x10000) : 0,
+                     reads ? pad_min((reads + 15) & ~15u) : pad_min(indexed ? 0x10000 : 0x1000));
+}
+
+namespace {
+
 // The sets being built: scratch kept from draw to draw (three vectors, one of them ~130 KB, were allocated per draw).
 struct SetWrite {  // one write of a set, as the set cache compares it
     uint32_t binding = 0, type = 0;
@@ -402,6 +422,17 @@ uint64_t handle_bits(H h) {
 // not built again. Consumed by bind_sets.
 PerThread<VkDescriptorSet> g_keep_set2;
 
+// In front of the set cache: the set each slot k got last, with its writes. Runs of draws of one material bind the same
+// sets 0/1 (their per-draw blocks go by dynamic offset), and the cache's probe and compare touched cold memory for each
+// of them (~4,900 draws a frame on the S20 FE). Valid within the cache's generation (one submit).
+struct LastSet {
+    uint64_t generation = 0;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    std::vector<SetWrite> key;
+};
+PerThread<LastSet[4]> g_last_set;
+
 void resolve_sets(const ProgramLayout& layout) {
     Descriptors& d = (*g_sets);
     for (uint32_t k = 0; k < 4; k++) {
@@ -410,7 +441,6 @@ void resolve_sets(const ProgramLayout& layout) {
             continue;
         }
         d.key.clear();
-        uint64_t h = handle_bits(layout.sets[k]) * 0x9E3779B97F4A7C15ull;
         for (size_t i = 0; i < d.writes.size(); i++) {
             if (d.set_index[i] != k) continue;
             const VkWriteDescriptorSet& w = d.writes[i];
@@ -421,13 +451,21 @@ void resolve_sets(const ProgramLayout& layout) {
             else if (w.pImageInfo)
                 e.a = handle_bits(w.pImageInfo->imageView), e.b = handle_bits(w.pImageInfo->sampler),
                 e.c = uint64_t(w.pImageInfo->imageLayout);
-            for (uint64_t v : {uint64_t(e.binding) << 32 | e.type, e.a, e.b, e.c})
-                h = (h ^ v) * 0x100000001B3ull, h ^= h >> 31;
             d.key.push_back(e);
         }
         if (k == 0) d.key0 = d.key;
         d.sets[k] = VK_NULL_HANDLE;
         if (d.key.empty()) continue;
+        LastSet& last = (*g_last_set)[k];
+        if (last.generation == (*g_set_generation) && last.layout == layout.sets[k] && last.key.size() == d.key.size() &&
+            std::memcmp(last.key.data(), d.key.data(), d.key.size() * sizeof(SetWrite)) == 0) {
+            d.sets[k] = last.set, (*g_set_hits)++, (*g_set_hits_by)[k]++;
+            continue;
+        }
+        uint64_t h = handle_bits(layout.sets[k]) * 0x9E3779B97F4A7C15ull;
+        for (const SetWrite& e : d.key)
+            for (uint64_t v : {uint64_t(e.binding) << 32 | e.type, e.a, e.b, e.c})
+                h = (h ^ v) * 0x100000001B3ull, h ^= h >> 31;
         CachedSet* slot = nullptr;
         for (uint32_t probe = uint32_t(h >> 32);; probe++) {
             CachedSet& c = (*g_set_cache)[probe & (kSetSlots - 1)];
@@ -441,10 +479,15 @@ void resolve_sets(const ProgramLayout& layout) {
                 break;
             }
         }
-        if (d.sets[k]) continue;
+        auto remember = [&] { last.generation = (*g_set_generation), last.layout = layout.sets[k], last.set = d.sets[k], last.key = d.key; };
+        if (d.sets[k]) {
+            remember();
+            continue;
+        }
         d.sets[k] = descriptor_set(layout.sets[k]), (*g_set_misses)++, (*g_set_misses_by)[k]++;
         for (size_t i = 0; i < d.writes.size(); i++)
             if (d.set_index[i] == k) d.writes[i].dstSet = d.sets[k];
+        if (d.sets[k]) remember();
         if (!d.sets[k] || (*g_set_used) >= kSetSlots / 2) continue;
         *slot = {(*g_set_generation), h, layout.sets[k], uint32_t((*g_set_arena).size()), uint32_t(d.key.size()), d.sets[k]};
         (*g_set_arena).insert((*g_set_arena).end(), d.key.begin(), d.key.end());
@@ -568,10 +611,6 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                 case NvnSource::UniformAsStorage: {
                     const Range& r = b.nvn.index >= 0 && b.nvn.index < 18 ? (*g_state).uniforms[st][b.nvn.index] : Range{};
                     const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
-                    // Reads past the bound size return 0 on Maxwell and garbage on Metal (a UI shader read c3[10]
-                    // of a 0x90-byte block and wrote Inf): the bound data goes in a zero-padded 4 KB at least.
-                    // Banks the shader indexes with a computed value (clamped to 64 KB, nvn_spirv_patch.cpp): all
-                    // 64 KB, so every read past the data returns 0 as on Maxwell.
                     if (static const bool tr8 = std::getenv("NX_TRACE_C8") != nullptr; tr8 && s->stage == ShaderStage::Fragment && b.nvn.index == 5 && p) {
                         static int shown = 0;
                         if (shown++ % 5000 == 0) {  // tile light counts of the uber shaders' c8: word at 8196 + tile * 256
@@ -591,13 +630,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                                 (unsigned long long)nz, (long long)first, line.c_str());
                         }
                     }
-                    bool indexed = b.set == 0 && b.binding < 64 && (dynamic_uniform_bindings(s) >> b.binding & 1);
-                    // As far as the shader reads with constant indices when that is known (uniform_read_extents).
-                    const uint32_t reads = b.nvn.source == NvnSource::UniformBlock && !indexed && b.set == 0 &&
-                                                   b.binding < 64 && s->masks_known
-                                               ? s->uniform_extent[b.binding] : 0;
-                    info = buffer_of(cb, p, p ? std::min<uint64_t>(r.size, 0x10000) : 0,
-                                     reads ? pad_min((reads + 15) & ~15u) : pad_min(indexed ? 0x10000 : 0x1000));
+                    info = uniform_info(cb, s, b, r);
                     break;
                 }
                 case NvnSource::StorageBuffer: {

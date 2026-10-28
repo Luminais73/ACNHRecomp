@@ -163,6 +163,8 @@ struct BufferWrite {
     VkDescriptorBufferInfo info{};
 };
 uint32_t sets_set0_writes(BufferWrite* out, uint32_t max);
+// A uniform block binding's buffer (as build_sets makes it) from the range bound for it.
+VkDescriptorBufferInfo uniform_info(VkCommandBuffer cb, const ShaderInfo* s, const DescriptorBinding& b, const Range& r);
 VkDescriptorSet sets_write_set(VkDescriptorSetLayout layout, const BufferWrite* w, uint32_t n);  // NX_SET_CACHE (the fast path needs it)
 Upload zero_stream();  // 64 zero bytes for vertex binding 15
 // draw_inputs, with 16- and 32-bit indices through dedup_upload.

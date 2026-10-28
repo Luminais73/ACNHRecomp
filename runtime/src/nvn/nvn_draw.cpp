@@ -454,9 +454,17 @@ struct Merge {
     BufferWrite writes[64];
     uint32_t nwrites = 0;
     uint32_t n = 0, slot = 0, binding = 0, step = 0, range = 0;
+    // Run continuation (merge_continues): the data the run's last draw was built from. A next draw that binds the same
+    // but the run's block is counted in without building its sets and inputs again (~80% of the island's draws).
+    const DescriptorBinding* block = nullptr;  // the run's block in the vertex shader, a plain uniform block (n >= 2)
+    VkBuffer buffer = VK_NULL_HANDLE;           // the ring buffer the run's block copies are in
+    uint64_t epoch = 0, a0 = 0;
+    Range uniforms[2][18], storage[2][16], vertex_buffers[16];  // stages 0 and 1 (nvn_sets.cpp's api_stage)
+    int32_t viewport[4] = {}, scissor[4] = {};
+    bool has_viewport = false, has_scissor = false;
 };
 PerThread<Merge> g_merge;
-PerThread<uint64_t> g_merge_runs, g_merge_draws, g_merge_fallbacks;
+PerThread<uint64_t> g_merge_runs, g_merge_draws, g_merge_fallbacks, g_merge_quick;
 PerThread<uint64_t[20]> g_merge_why;  // NX_MERGE_WHY: why fast draws did not extend a run
 
 bool merge_on() {
@@ -515,6 +523,46 @@ void merge_flush() {
     (*g_bound_gen)++;  // set 0 is not what bind_sets' repeat check last bound
 }
 
+void merge_snapshot(Merge& m, const Cmd& c) {
+    const State& s = *g_state;
+    std::memcpy(m.uniforms, s.uniforms, sizeof m.uniforms);
+    std::memcpy(m.storage, s.storage, sizeof m.storage);
+    std::memcpy(m.vertex_buffers, s.vertex_buffers, sizeof m.vertex_buffers);
+    std::memcpy(m.viewport, s.viewport, sizeof m.viewport), std::memcpy(m.scissor, s.scissor, sizeof m.scissor);
+    m.has_viewport = s.has_viewport, m.has_scissor = s.has_scissor;
+    m.epoch = *g_upload_epoch, m.a0 = c.a[0];
+}
+
+// Whether this fast draw continues the run with only the run's block rebound since its last draw: everything else it
+// would build is what that draw built (same bindings, and no upload invalidated since: the same copies). Only the
+// block is uploaded; it must land at the run's next step.
+bool merge_continues(VkCommandBuffer cb, const Prepared& prep, bool indexed, const Cmd& c) {
+    Merge& m = *g_merge;
+    if (!m.on || m.n < 2 || !m.block || m.cb != cb || m.prep != &prep || (*g_bound).pipeline != m.pipeline ||
+        (*g_bound_gen) != m.bound_gen || m.indexed != indexed || c.i[0] != m.i[0] || c.i[1] != m.i[1] || c.i[2] != 0 ||
+        c.i[3] > 1 || (indexed && c.a[0] != m.a0) || m.epoch != *g_upload_epoch)
+        return false;
+    const State& s = *g_state;
+    const Range r = s.uniforms[0][m.block->nvn.index];
+    m.uniforms[0][m.block->nvn.index] = r;
+    if (std::memcmp(m.uniforms, s.uniforms, sizeof m.uniforms) != 0 ||
+        std::memcmp(m.storage, s.storage, sizeof m.storage) != 0 ||
+        std::memcmp(m.vertex_buffers, s.vertex_buffers, sizeof m.vertex_buffers) != 0 ||
+        std::memcmp(m.viewport, s.viewport, sizeof m.viewport) != 0 ||
+        std::memcmp(m.scissor, s.scissor, sizeof m.scissor) != 0 || m.has_viewport != s.has_viewport ||
+        m.has_scissor != s.has_scissor)
+        return false;
+    const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
+    if (!p || written_overlaps(p, std::min<uint64_t>(r.size, 0x10000))) return false;  // its copy may end the pass
+    if (uint64_t(m.n) * m.step + m.range > 0x10000) return false;
+    const VkDescriptorBufferInfo info = uniform_info(cb, prep.vs, *m.block, r);
+    if (info.buffer != m.buffer || info.range != m.range ||
+        info.offset != uint64_t(m.sets.offsets[m.slot]) + uint64_t(m.n) * m.step || m.epoch != *g_upload_epoch)
+        return false;
+    m.n++;
+    return true;
+}
+
 // Whether this fast draw only continues the held-back run (`rs`, `vp`, `sc`: what it would bind and set).
 bool merge_extends(VkCommandBuffer cb, const Prepared& prep, bool indexed, const Cmd& c, const DrawInputs& in,
                    const ResolvedSets& rs, const VkViewport& vp, const VkRect2D& sc) {
@@ -567,8 +615,15 @@ bool merge_extends(VkCommandBuffer cb, const Prepared& prep, bool indexed, const
         if (vs->uniform_extent[b] > range) return why(13);
         if (!instance_patchable(vs, b)) return why(19);
         m.slot = slot, m.binding = b, m.step = uint32_t(step), m.range = range;
+        m.block = nullptr, m.buffer = VK_NULL_HANDLE;
+        for (uint32_t k = 0; k < m.nwrites; k++)
+            if (m.writes[k].binding == b) m.buffer = m.writes[k].info.buffer;
+        for (const DescriptorBinding& db : vs->refl.bindings)
+            if (db.set == 0 && db.binding == b && db.nvn.source == NvnSource::UniformBlock && db.nvn.index >= 0 &&
+                db.nvn.index < 18)
+                m.block = &db;
     } else if (slot != m.slot || step != int64_t(m.n) * m.step) {
-        return why(13);
+        return why(15);  // another block, or not the next step
     }
     if (uint64_t(m.n) * m.step + m.range > 0x10000) return why(14);  // maxUniformBufferRange
     m.n++;
@@ -612,6 +667,10 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     if (prep.valid && prep.gen == *g_state_gen && prep.cb == cb && prep.mode == mode && *g_rendering &&
         targets_same(prep.t, t) && fast_draw_on() && prepared_holds(prep)) {
         (*g_fast_hits)++;
+        if (merge_on() && merge_continues(cb, prep, indexed, c)) {
+            (*g_merge_quick)++, (*g_stats).done++;
+            return true;
+        }
         // The kept set 2 is for this draw's bind_sets only: every way out before it drops it (left set, the next
         // build_sets, of another layout or a dispatch, would bind it: a GPU fault).
         auto give_up = [] {
@@ -639,6 +698,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             VkRect2D sc;
             draw_viewport(prep.ui_x, vp, sc);
             if (merge_extends(cb, prep, indexed, c, in, rs, vp, sc)) {
+                merge_snapshot(*g_merge, c);
                 (*g_stats).done++;
                 return true;
             }
@@ -658,6 +718,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             m.indexed = indexed, m.i[0] = c.i[0], m.i[1] = c.i[1], m.i[2] = c.i[2];
             m.in = in, m.sets = rs, m.n = 1;
             m.nwrites = sets_set0_writes(m.writes, 64);
+            m.block = nullptr;
+            merge_snapshot(m, c);
             draw_viewport(prep.ui_x, m.vp, m.sc);
             if (!m.nwrites) merge_flush();
         }
@@ -1118,9 +1180,10 @@ void draw_log_stats() {
     *g_fast_hits = *g_fast_misses = 0;
     if (*g_merge_runs)
         log("nvn: draw merging: %llu draws in %llu instanced draws (%.1f a draw), %llu runs drawn one by one (pipeline "
-            "compiling)", (unsigned long long)*g_merge_draws, (unsigned long long)*g_merge_runs,
-            double(*g_merge_draws) / double(*g_merge_runs), (unsigned long long)*g_merge_fallbacks);
-    *g_merge_runs = *g_merge_draws = *g_merge_fallbacks = 0;
+            "compiling), %llu counted in as continuations", (unsigned long long)*g_merge_draws,
+            (unsigned long long)*g_merge_runs, double(*g_merge_draws) / double(*g_merge_runs),
+            (unsigned long long)*g_merge_fallbacks, (unsigned long long)*g_merge_quick);
+    *g_merge_runs = *g_merge_draws = *g_merge_fallbacks = *g_merge_quick = 0;
     if (std::getenv("NX_MERGE_WHY")) {
         std::string w;
         for (int k = 0; k < 20; k++) w += " " + std::to_string((*g_merge_why)[k]), (*g_merge_why)[k] = 0;
