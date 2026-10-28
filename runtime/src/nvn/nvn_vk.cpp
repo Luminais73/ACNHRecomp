@@ -907,7 +907,10 @@ void display_timing_log() {
 // present is handed to this thread instead, and the replay goes on with the next frame. Everything else that uses the
 // queue or the swapchain first waits for that present to be done (presenter_wait), or holds the queue lock for its
 // submit (vkQueueSubmit and vkQueuePresentKHR on one queue must not overlap).
-// NX_PRESENT_THREAD=1/0: on/off (default: on Android with frame generation, and on macOS).
+// Without frame generation, the game frame's repeat (its second refresh at 30 fps, present_vsync_paced) is handed over
+// the same way: presented from the replay thread it waited ~16 ms for the frame before on the GPU (26 fps at 1080 rows
+// on the S20 FE, the GPU idle meanwhile and clocked down to 400 MHz by the system).
+// NX_PRESENT_THREAD=1/0: on/off (default: on Android and on macOS).
 struct PendingPresent {
     VkFence before = VK_NULL_HANDLE;  // the image queued before it done on the GPU (g_gen_fence), or none
     VkSemaphore rendered = VK_NULL_HANDLE;
@@ -931,7 +934,7 @@ bool presenter_wanted() {
         const char* e = std::getenv("NX_PRESENT_THREAD");
         if (e) return e[0] == '1';
 #if defined(__ANDROID__)
-        return framegen_wanted();
+        return true;
 #elif defined(__APPLE__)
         // MoltenVK: the present waits for the next drawable; off the replay thread the north walk's lowest windows on
         // a warm M1 Air went from 53-56 to 57-59 fps.
@@ -1110,7 +1113,13 @@ void present_image(const int32_t* crop, Record&& record) {
         frame_submit(acquired, rendered, {}, dump);
     else
         end_and_wait(acquired, rendered);
-    if (!real && presenter_wanted()) {  // a fence behind the generated image (see g_gen_fence)
+    // Handed to the presenter thread: game frames, and on Android without frame generation their repeats too.
+#if defined(__ANDROID__)
+    const bool handed = presenter_wanted() && (real || !framegen_wanted());
+#else
+    const bool handed = presenter_wanted() && real;
+#endif
+    if (!real && presenter_wanted() && framegen_wanted()) {  // a fence behind the generated image (see g_gen_fence)
         if (!g_gen_fence) {
             VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
             p_vkCreateFence(g_device, &fci, nullptr, &g_gen_fence);
@@ -1134,7 +1143,7 @@ void present_image(const int32_t* crop, Record&& record) {
     VkPresentTimeGOOGLE when{uint32_t(display_timing_next(real)), 0};
     if (real) vblank_hold();  // on the display's vblank its interval asks for (hle_vi.cpp)
     parts.mark(3);
-    if (real && presenter_wanted()) {
+    if (handed) {
         presenter_post({g_gen_fence_used ? g_gen_fence : VK_NULL_HANDLE, rendered, index, bool(g_display_timing), when});
         g_gen_fence_used = false;
     } else {

@@ -118,6 +118,7 @@ Scale wanted(uint64_t present) {
     } else if (int rows = std::atoi(r.c_str()); rows > 0) {
         s = rows / native;
     }
+    s *= plat::dynamic_render_scale();  // thermal.cpp: fewer rows while the GPU cannot keep up (output unchanged)
     // video.antialiasing / NX_AA supersampling: that many times the rows, scaled down again when presented.
     std::string aa = setting("NX_AA", "video.antialiasing", "off");
     if (aa == "ssaa15") s *= 1.5;

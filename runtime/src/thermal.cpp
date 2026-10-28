@@ -71,12 +71,19 @@ const Mode kModes[3] = {
 const int kCpuCaps[] = {1600, 1500, 1400, 1300, 1200, 1100, 1000};
 constexpr int kCpuLevels = int(sizeof kCpuCaps / sizeof kCpuCaps[0]);
 
+// The environment (tests) wins over config.ini.
+std::string setting_value(const char* env, const char* key, const char* fallback) {
+    if (const char* e = std::getenv(env); e && *e) return e;
+    return config_get(key, fallback);
+}
+
 int parse_mode(const char* s) { return std::strcmp(s, "performance") == 0 ? 0 : std::strcmp(s, "cool") == 0 ? 2 : 1; }
 
 // Frames since the governor last looked (written by the presenting thread, taken by the governor).
 constexpr int kBins = 80;  // a frame's CPU work over the period, 2.5% each; the last one 197.5% and more
 std::atomic<int64_t> g_period{0}, g_replay{0}, g_main{0};
 std::atomic<uint32_t> g_frames{0}, g_late{0};
+std::atomic<float> g_dyn_scale{1.0f};  // dynamic resolution: the rows' share (Governor::dynamic_resolution)
 std::atomic<uint32_t> g_bins[kBins];
 
 std::mutex g_mx;
@@ -181,6 +188,7 @@ struct Governor {
     bool gpu_in_mhz = false;
     std::vector<long> steps;   // MHz, ascending
     long gpu_usual = 0;        // MHz: the system's value at start (441 on the S20 FE, even cold)
+    bool gpu_sys_seen = false;  // the system wrote its GPU cap since
     long gpu_restore = 0;      // MHz: the system's latest own value
     long gpu_written = 0, gpu_read = 0;
     long ssrm_low = 0;         // MHz: the system's own value when under its usual one (its thermal limit), else 0
@@ -203,6 +211,9 @@ struct Governor {
     std::string reads, restore_sent;
     double busy = -1, clk = 0, cpu_p90 = 0, late = 0;
     uint32_t frames = 0, late_n = 0;
+    uint64_t decided_ns = 0;  // the last decide()
+    uint32_t dyn_starved = 0, dyn_roomy = 0;  // decisions in a row for dynamic_resolution
+    uint64_t dyn_changed_ns = 0;
     float headroom = -1;
 
     int top() const { return int(steps.size()) - 1; }
@@ -368,6 +379,11 @@ struct Governor {
         // A GPU cap we did not write: the system's (SSRM). Its usual value is what is put back; under that, it is its
         // thermal limit, which balanced and cool keep to.
         if (gpu_written && gpu_read > 0 && gpu_read != gpu_written) {
+            // The first value the system writes while the phone is cool is its usual one: the value at start can be
+            // what an earlier session (or a test script) left, 587 on the S20 FE, and SSRM's everyday 441 then
+            // looked like a thermal limit, kept for the whole session (GPU at 400 MHz, a quarter of the frames late).
+            if (!gpu_sys_seen && temp > 0 && temp < 65) gpu_usual = gpu_restore = gpu_read;
+            gpu_sys_seen = true;
             if (gpu_read >= gpu_usual) gpu_restore = gpu_read;
             long low = gpu_read < gpu_usual ? gpu_read : 0;
             if (low != ssrm_low) log("thermal: the system's GPU cap %ld MHz%s", gpu_read, low ? " (its thermal limit)" : "");
@@ -389,10 +405,57 @@ struct Governor {
         return true;
     }
 
+    // Dynamic resolution (video.dynamic_resolution = on, NX_DYNAMIC_RES=1; off by default, balanced and cool only): frames late
+    // while the GPU can go no higher (the system's thermal limit, or our ceiling) take the rows to 5/6 (1080 -> 900,
+    // the output size unchanged) for at least a minute; back at full rows once there is no system limit and the GPU's
+    // work would fit the ceiling with a third to spare. Each change makes the screen targets again (one frame late).
+    template <class ShareAt>
+    void dynamic_resolution(const Mode& m, int hi, ShareAt&& share_at) {
+        static const bool on = [] {
+            const std::string v = setting_value("NX_DYNAMIC_RES", "video.dynamic_resolution", "off");
+            return v == "on" || v == "1";
+        }();
+        if (!on || m.gpu_target >= 1.0) {  // performance: full rows always
+            g_dyn_scale.store(1.0f, std::memory_order_relaxed);
+            return;
+        }
+        const uint64_t now = monotonic_ns();
+        const bool low = g_dyn_scale.load(std::memory_order_relaxed) < 1.0f;
+        const bool ceiling = gpu_idx >= hi || (ssrm_low && ssrm_low <= steps[size_t(std::min(gpu_idx, hi))]);
+        const bool starved = late > 0.04 && late_n >= 3 && busy >= 0.75 && ceiling;
+        dyn_starved = starved ? dyn_starved + 1 : 0;
+        const bool roomy = !ssrm_low && late_n == 0 && busy >= 0 && share_at(hi) * 1.35 < m.gpu_target;
+        dyn_roomy = roomy ? dyn_roomy + 1 : 0;
+        if (now - dyn_changed_ns < 60'000'000'000ull && dyn_changed_ns) return;
+        if (!low && dyn_starved >= 2) {
+            g_dyn_scale.store(5.0f / 6.0f, std::memory_order_relaxed);
+            dyn_changed_ns = now, dyn_starved = dyn_roomy = 0;
+            log("thermal: %s: frames late at the GPU's ceiling (%.0f%% busy at %.0f MHz, system cap %ld MHz): rows x5/6",
+                m.name, busy * 100, clk, ssrm_low);
+        } else if (low && dyn_roomy >= 10) {
+            g_dyn_scale.store(1.0f, std::memory_order_relaxed);
+            dyn_changed_ns = now, dyn_starved = dyn_roomy = 0;
+            log("thermal: %s: room on the GPU again (%.0f%% busy at %.0f MHz): full rows", m.name, busy * 100, clk);
+        }
+    }
+
     void decide(int mode_idx) {
         const Mode& m = kModes[mode_idx];
         frames = g_frames.exchange(0, std::memory_order_relaxed);
         late_n = g_late.exchange(0, std::memory_order_relaxed);
+        // Frames missing against the time passed count as late too: a frame shown for three refreshes instead of two
+        // (50 ms at 30 fps) is under the 1.25-period mark when the next one comes early, and at 28 fps the governor
+        // saw "0 of 59 late" and took the GPU cap further down. Only while the game ran most of the window.
+        {
+            const uint64_t now = monotonic_ns();
+            const int64_t p = g_period.load(std::memory_order_relaxed);
+            if (decided_ns && p > 0) {
+                const double expected = double(now - decided_ns) / double(p);
+                if (frames >= 20 && double(frames) >= expected * 0.6 && expected - frames > late_n)
+                    late_n = uint32_t(expected - frames);
+            }
+            decided_ns = now;
+        }
         uint32_t bins[kBins], seen = 0;
         for (int k = 0; k < kBins; k++) bins[k] = g_bins[k].exchange(0, std::memory_order_relaxed);
         int p90 = 0;
@@ -438,7 +501,11 @@ struct Governor {
             // Frames late: up at once. The GPU when it is near full, the CPU when its work is, else what came down last.
             bool gpu_full = work >= 0 && share_at(std::min(gpu_idx, hi)) > 0.9;
             bool cpu_full = cpu_p90 > m.cpu_target;
-            bool raise_gpu = gpu && (gpu_full || (!cpu_full && last_down_gpu)), raise_cpu = cpu_full || !raise_gpu;
+            // The big cores already at their top: only the GPU can help (frame generation off, the GPU's busy share
+            // stays under 90% while frames are late: the replay and the GPU's work in turn make the frame).
+            const bool cpu_top = cpu_level <= min_l;
+            bool raise_gpu = gpu && (gpu_full || cpu_top || (!cpu_full && last_down_gpu)),
+                 raise_cpu = !cpu_top && (cpu_full || !raise_gpu);
             if (raise_gpu) gpu_idx++, gpu_hold = 5;
             if (raise_cpu) cpu_level = cpu_step(cpu_level, -1, min_l, max_l), cpu_hold = 5;
             gpu_votes = cpu_votes = 0;
@@ -465,6 +532,7 @@ struct Governor {
         }
         gpu_idx = gpu ? std::clamp(gpu_idx, lo, top()) : 0;
         cpu_level = std::clamp(cpu_level, min_l, max_l);
+        dynamic_resolution(m, hi, share_at);
         const int gpu_now = std::min(gpu_idx, hi), gpu_before = std::min(gpu_was, hi);
         if (gpu_now != gpu_before || cpu_cap_mhz(cpu_level) != cpu_cap_mhz(cpu_was))
             log("thermal: %s: GPU cap %ld -> %ld MHz, big cores %ld -> %ld MHz (GPU %.0f%% busy at %.0f MHz, CPU work "
@@ -621,6 +689,8 @@ void thermal_pause(bool paused) {
     g_cv.notify_all();
 }
 
+float dynamic_render_scale() { return g_dyn_scale.load(std::memory_order_relaxed); }
+
 void frame_period(int64_t ns) {
     if (ns > 0) g_period.store(ns, std::memory_order_relaxed);
 }
@@ -643,6 +713,7 @@ double thermal_adpf_share(int) { return 0.0; }
 float thermal_headroom() { return -1.0f; }
 void thermal_start() {}
 void thermal_pause(bool) {}
+float dynamic_render_scale() { return 1.0f; }
 void frame_period(int64_t) {}
 int64_t frame_period_ns() { return 0; }
 void frame_replay_work(int64_t) {}
