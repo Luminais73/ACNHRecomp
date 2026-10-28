@@ -240,6 +240,7 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img, uint64_
         p_vkCmdCopyBufferToImage(cb, u.buffer, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
         return;
     }
+    const uint64_t p0 = plat::monotonic_ns();
     auto levels = deswizzle_texture(reinterpret_cast<const uint8_t*>(t.memory), t.storage_size, img.width,
                                     img.height, layers, img.levels, bw, bh, bytes, linear, t.block_height_gobs);
     if (levels.empty()) {
@@ -283,11 +284,21 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img, uint64_
     }
     // Widened, every offset in the linear buffer doubles (level offsets are multiples of the 4-byte texel).
     uint64_t scale = widen ? 2 : 1;
+    const uint64_t p1 = plat::monotonic_ns();
     Upload u = texture_stage(linear.size() * scale);
+    const uint64_t p2 = plat::monotonic_ns();
     if (widen)
         widen_r11g11b10(linear.data(), u.ptr, linear.size() / 4);
     else
         std::memcpy(u.ptr, linear.data(), linear.size());
+    // A block-linear upload over 4 ms on the replay thread (a frame late at 30 fps when it adds up): where it went.
+    if (const uint64_t p3 = plat::monotonic_ns(); p3 - p0 > 4'000'000) {
+        static int logged = 0;
+        if (logged++ < 60)
+            log("upload slow: %ux%u fmt %#x levels %u layers %u, %.1f MB: untile %.1f ms, stage %.1f ms, copy %.1f ms",
+                img.width, img.height, t.format, img.levels, layers, double(linear.size()) / 1e6, double(p1 - p0) / 1e6,
+                double(p2 - p1) / 1e6, double(p3 - p2) / 1e6);
+    }
     for (uint32_t k = 0; k < levels.size(); k++) {
         VkBufferImageCopy r{};
         r.bufferOffset = u.offset + levels[k].offset * scale;

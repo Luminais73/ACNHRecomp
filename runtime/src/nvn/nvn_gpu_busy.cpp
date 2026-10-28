@@ -78,6 +78,7 @@ void gpu_busy_part_end(uint32_t slot, uint32_t part, VkCommandBuffer cb) {
 void gpu_busy_retired(uint32_t slot, uint64_t queued) {
     if (!gpu_busy_on() || slot >= kSlots || !g_pools[slot] || !queued) return;
     uint64_t first = UINT64_MAX, last = 0;
+    double busy = 0;
     for (uint32_t p = 0; p < kParts; p++) {
         if (!(queued >> p & 1)) continue;
         uint64_t t[2] = {};
@@ -87,11 +88,18 @@ void gpu_busy_retired(uint32_t slot, uint64_t queued) {
             continue;
         }
         if (t[1] < t[0]) continue;
-        g_busy_ns += double(t[1] - t[0]) * g_period_ns, g_parts++;
+        g_busy_ns += double(t[1] - t[0]) * g_period_ns, g_parts++, busy += double(t[1] - t[0]) * g_period_ns;
         g_by_label[g_labels[slot][p].empty() ? "(no pass)" : g_labels[slot][p]] += double(t[1] - t[0]) * g_period_ns;
         first = std::min(first, t[0]), last = std::max(last, t[1]);
     }
     if (last > first) g_span_ns += double(last - first) * g_period_ns;
+    // A slot whose GPU work alone passes 32 ms: the frame cannot be shown on time at 30 fps.
+    static uint64_t prev_first = 0;
+    static int slow = 0;
+    if (busy > 32e6 && slow++ < 200)
+        log("gpu slow slot: busy %.1f ms, span %.1f ms, %.1f ms after the previous slot's start", busy / 1e6,
+            double(last - first) * g_period_ns / 1e6, prev_first ? double(first - prev_first) * g_period_ns / 1e6 : 0.0);
+    if (first != UINT64_MAX) prev_first = first;
 }
 
 void gpu_busy_log(uint64_t frames) {

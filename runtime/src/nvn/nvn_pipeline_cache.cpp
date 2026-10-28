@@ -170,7 +170,7 @@ void note_module_created(uint64_t ns) {
 // Every present: a frame shown 50 ms or more after the previous one (a visible stutter at 30 fps) is logged with what
 // the replay spent on shaders in between, so a stutter report says whether it was a shader build or something else.
 // NX_HITCH_MS=<ms> sets the threshold; 300 lines at most per run.
-void present_hitch_check(uint64_t replay_ns, uint64_t upload_bytes) {
+void present_hitch_check(uint64_t replay_ns, uint64_t upload_bytes, uint64_t present_ns, uint64_t fence_ns) {
     static const double limit = std::getenv("NX_HITCH_MS") ? std::atof(std::getenv("NX_HITCH_MS")) : 50.0;
     static uint64_t last = 0, presents = 0;
     static int lines = 0;
@@ -180,10 +180,13 @@ void present_hitch_check(uint64_t replay_ns, uint64_t upload_bytes) {
     FrameCost& f = g_frame_cost;
     if (ms >= limit && lines < 300) {
         lines++;
-        log("hitch: present %llu, %.1f ms after the previous; replay and submit %.1f ms, upload %.1f MB; built %llu "
+        // The rest of the interval (not replay, fences or the previous present): waiting for the game's next frame.
+        log("hitch: present %llu, %.1f ms after the previous; replay and submit %.1f ms (fences %.1f), the previous "
+            "present %.1f ms, upload %.1f MB; built %llu "
             "pipelines (%.1f ms), %llu shader modules (%.1f ms); waited for %llu compiles in flight (%.1f ms); "
             "%llu textures uploaded (%.1f MB, %.1f ms)",
-            (unsigned long long)presents, ms, double(replay_ns) / 1e6, double(upload_bytes) / 1e6,
+            (unsigned long long)presents, ms, double(replay_ns) / 1e6, double(fence_ns) / 1e6,
+            double(present_ns) / 1e6, double(upload_bytes) / 1e6,
             (unsigned long long)f.pipelines.load(), double(f.pipeline_ns.load()) / 1e6,
             (unsigned long long)f.modules.load(), double(f.module_ns.load()) / 1e6, (unsigned long long)f.waited.load(),
             double(f.waited_ns.load()) / 1e6, (unsigned long long)f.textures.load(),

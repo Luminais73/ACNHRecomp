@@ -120,7 +120,10 @@ void start_thread(ThreadFn fn, void* arg, size_t stack_size) {
 }
 
 void exit_thread() { pthread_exit(nullptr); }
-void exit_process(int code) { _exit(code); }
+void exit_process(int code) {
+    nx::log_flush();
+    _exit(code);
+}
 
 void sleep_ns(int64_t ns) {
     timespec ts{time_t(ns / 1000000000), long(ns % 1000000000)};
@@ -864,7 +867,7 @@ extern "C" void android_main(android_app* app) {
             android_poll_source* src;
             while (ALooper_pollOnce(100, nullptr, &events, reinterpret_cast<void**>(&src)) >= 0) {
                 if (src) src->process(app, src);
-                if (app->destroyRequested) _exit(0);
+                if (app->destroyRequested) nx::log_flush(), _exit(0);
             }
         }
     }
@@ -937,7 +940,7 @@ extern "C" void android_main(android_app* app) {
         android_poll_source* src;
         while (ALooper_pollOnce(started ? 0 : 50, nullptr, &events, reinterpret_cast<void**>(&src)) >= 0) {
             if (src) src->process(app, src);
-            if (app->destroyRequested) _exit(0);
+            if (app->destroyRequested) nx::log_flush(), _exit(0);
         }
         if (!started && g_window) {
             started = true;

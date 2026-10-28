@@ -16,6 +16,10 @@
 #define NX_GAME_API
 #endif
 
+namespace nx {
+void log_flush();  // loader.cpp: the lines queued for the log file, written now
+}  // namespace nx
+
 namespace nx::plat {
 
 // ---- memory: fixed-address reservations (guest pointers are host pointers) ----

@@ -130,7 +130,7 @@ static void watchdog(void*) {
 
 
 // Stalls: while no frame comes for more than 60 ms, sample where every guest thread is (its lr, every 5 ms); a
-// stall over 100 ms is logged with each thread's most frequent place, to tell what the frame waited for.
+// stall over 100 ms (NX_STALL_MS=<ms>: that long, sampling from 3/5 of it) is logged with each thread's most frequent place, to tell what the frame waited for.
 // NX_THREAD_DUMP_AT=<seconds>: once, every guest thread's call chain (frame-pointer walk), to see what a stuck game
 // waits for.
 static void dump_threads() {
@@ -155,6 +155,8 @@ static void dump_threads() {
 static void stall_sampler(void*) {
     static const char* dump_env = std::getenv("NX_THREAD_DUMP_AT");
     uint64_t dump_at = dump_env ? plat::monotonic_ns() + uint64_t(std::atof(dump_env) * 1e9) : 0;
+    static const uint64_t report_ms = std::getenv("NX_STALL_MS") ? std::strtoull(std::getenv("NX_STALL_MS"), nullptr, 10) : 100;
+    const uint64_t sample_ns = report_ms * 600'000;
     uint64_t last_frame = 0, since = plat::monotonic_ns();
     std::map<std::pair<uint64_t, uint64_t>, uint32_t> hits;  // (thread id, guest lr) -> samples
     for (;;) {
@@ -163,7 +165,7 @@ static void stall_sampler(void*) {
         if (dump_at && now >= dump_at) dump_threads(), dump_at = 0;
         if (f != last_frame || plat::window_minimized()) {
             uint64_t ms = (now - since) / 1'000'000;
-            if (last_frame && ms > 100 && !hits.empty()) {
+            if (last_frame && ms > report_ms && !hits.empty()) {
                 log("stall: %llu ms without a frame after frame %llu; where the threads were:", (unsigned long long)ms,
                     (unsigned long long)last_frame);
                 std::map<uint64_t, std::pair<uint64_t, uint32_t>> top;  // thread -> (lr, samples)
@@ -181,7 +183,7 @@ static void stall_sampler(void*) {
             since = now;
             continue;
         }
-        if (!f || now - since < 60'000'000) continue;
+        if (!f || now - since < sample_ns) continue;
         std::lock_guard al(g_all_lock);
         for (auto& w : g_all)
             if (auto t = w.lock(); t && t->started && !t->exited) hits[{t->id, t->ctx.x[30]}]++;

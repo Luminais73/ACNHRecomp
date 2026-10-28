@@ -133,6 +133,7 @@ void start_memory_guard() {
             if (f > limit) {
                 log("memory: %.2f GB is over the %.1f GB limit (NX_MEM_LIMIT_GB): stopping",
                     double(f) / double(1ull << 30), gb);
+                log_flush();
                 _exit(3);
             }
         }

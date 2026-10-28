@@ -1,6 +1,8 @@
 // Module loader and dynamic linker (what rtld does on Horizon), indirect-call dispatch and HLE thunks.
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdlib>
@@ -8,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -55,32 +58,97 @@ std::string log_file_path() {
     return g_log_path;
 }
 
+// Lines go to the file and the system log on a writer thread of their own: written and flushed from the calling thread,
+// a line on the phone's SD card (FUSE) now and then took 20-35 ms, and the replay thread's periodic counters made a
+// frame late (a 50 ms hitch every minute or so on the S20 FE). A crash, a fatal error or a GPU hang switches to
+// writing at once (everything queued first), so that the lines before the process ends are on disk; log_flush() too.
+namespace {
+std::mutex g_write_lock;  // taken before g_log_lock: the order of the lines on disk
+std::condition_variable g_log_cv;
+std::string g_pending;
+// Elsewhere every line is written at once, as before (a local disk; exit_process does not flush there).
+#if defined(__ANDROID__)
+bool g_log_sync = false;
+#else
+bool g_log_sync = true;
+#endif
+bool g_writer = false;
+
+void open_log() {  // under g_log_lock
+    if (g_log_file) return;
+    const char* path = std::getenv("NX_LOG");
+#if defined(__ANDROID__)
+    std::string def = plat::data_root() + "/nx.log";  // next to the data, readable from the phone
+#else
+    std::string def = plat::data_root() + "/../nx.log";
+#endif
+    std::string file = path ? path : def;
+    g_log_path = file;
+    // Keep the previous session's log (a problem report should survive reopening the game).
+    std::remove((file + ".prev").c_str());
+    std::rename(file.c_str(), (file + ".prev").c_str());
+    g_log_file = std::fopen(file.c_str(), "w");
+}
+
+// What is queued, written; the caller holds g_write_lock and not g_log_lock.
+void write_pending() {
+    std::string lines;
+    FILE* f;
+    {
+        std::lock_guard lk(g_log_lock);
+        lines.swap(g_pending);
+        f = g_log_file;
+    }
+    if (lines.empty()) return;
+    for (size_t at = 0; at < lines.size();) {
+        size_t end = lines.find('\n', at);
+        lines[end] = 0;
+        plat::log_line(lines.c_str() + at);
+        lines[end] = '\n';
+        at = end + 1;
+    }
+    if (f) {
+        std::fwrite(lines.data(), 1, lines.size(), f);
+        std::fflush(f);
+    }
+}
+}  // namespace
+
+void log_flush() {
+    std::lock_guard w(g_write_lock);
+    write_pending();
+}
+
 void log(const char* fmt, ...) {
     char buf[2048];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
-    std::lock_guard lk(g_log_lock);
-    if (!g_log_file) {
-        const char* path = std::getenv("NX_LOG");
-#if defined(__ANDROID__)
-        std::string def = plat::data_root() + "/nx.log";  // next to the data, readable from the phone
-#else
-        std::string def = plat::data_root() + "/../nx.log";
-#endif
-        std::string file = path ? path : def;
-        g_log_path = file;
-        // Keep the previous session's log (a problem report should survive reopening the game).
-        std::remove((file + ".prev").c_str());
-        std::rename(file.c_str(), (file + ".prev").c_str());
-        g_log_file = std::fopen(file.c_str(), "w");
+    bool now;
+    {
+        std::lock_guard lk(g_log_lock);
+        open_log();
+        if (std::strncmp(buf, "CRASH", 5) == 0 || std::strncmp(buf, "FATAL", 5) == 0 || std::strstr(buf, "GPU hang"))
+            g_log_sync = true;
+        g_pending += buf;
+        g_pending += '\n';
+        now = g_log_sync;
+        if (!now && !g_writer) {
+            g_writer = true;
+            std::thread([] {
+                for (;;) {
+                    {
+                        std::unique_lock lk(g_log_lock);
+                        g_log_cv.wait_for(lk, std::chrono::milliseconds(250), [] { return !g_pending.empty(); });
+                    }
+                    log_flush();
+                }
+            }).detach();
+        }
     }
-    plat::log_line(buf);
-    if (g_log_file) {
-        std::fprintf(g_log_file, "%s\n", buf);
-        std::fflush(g_log_file);
-    }
+    if (now) log_flush();
+    else g_log_cv.notify_one();
 }
 
 void fatal(const char* fmt, ...) {

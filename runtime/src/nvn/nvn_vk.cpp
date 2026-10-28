@@ -1193,9 +1193,12 @@ void gpu_present(uint64_t texture, const int32_t* crop, int interval) {
     std::unique_lock lk(g_gpu);
     g_replay_presents++;
     {  // this frame's replay work and uploads, from the window's running sums (log_timing clears them)
-        static uint64_t work0 = 0, up0 = 0;
+        static uint64_t work0 = 0, up0 = 0, pres0 = 0, fence0 = 0;
         uint64_t work = g_timing.replay_ns + g_timing.encode_ns + g_timing.fence_ns, up = g_timing.upload_bytes;
-        present_hitch_check(work >= work0 ? work - work0 : work, up >= up0 ? up - up0 : up);
+        uint64_t pres = g_timing.present_ns, fence = g_timing.fence_ns;
+        present_hitch_check(work >= work0 ? work - work0 : work, up >= up0 ? up - up0 : up,
+                            pres >= pres0 ? pres - pres0 : pres, fence >= fence0 ? fence - fence0 : fence);
+        pres0 = pres, fence0 = fence;
         plat::frame_replay_work(int64_t(work >= work0 ? work - work0 : work));  // ADPF and the thermal governor
         work0 = work, up0 = up;
     }
