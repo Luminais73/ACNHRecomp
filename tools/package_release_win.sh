@@ -49,7 +49,7 @@ cp "$SDL/bin/SDL3.dll" "$R/"
 # The one runtime DLL mingw's libstdc++ threads still import (zlib-style licence, mingw-w64).
 WINPTHREAD=$(x86_64-w64-mingw32-g++ -print-file-name=libwinpthread-1.dll)
 [ -f "$WINPTHREAD" ] || WINPTHREAD=$(dirname "$(command -v x86_64-w64-mingw32-g++)")/../x86_64-w64-mingw32/bin/libwinpthread-1.dll
-[ -f "$WINPTHREAD" ] || WINPTHREAD=$(find "$(brew --prefix mingw-w64 2>/dev/null || echo /usr)" -name libwinpthread-1.dll -path "*x86_64*" | head -1)
+[ -f "$WINPTHREAD" ] || WINPTHREAD=$(find -L "$(brew --prefix mingw-w64 2>/dev/null || echo /usr)/" -name libwinpthread-1.dll -path "*x86_64*" 2>/dev/null | head -1)
 cp "$WINPTHREAD" "$R/"
 printf '@echo off\r\nrem Double-click: opens the launcher, which sets the game up from your own files (README, "Installation").\r\ncd /d "%%~dp0"\r\nstart "" "ACNHRecomp Launcher.exe"\r\n' > "$R/Start ACNHRecomp.bat"
 (cd "$OUT" && zip -qr "../$(basename "$OUT").zip" ACNHRecomp)
