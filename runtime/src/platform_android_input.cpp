@@ -195,6 +195,8 @@ bool headless() {  // NX_HEADLESS (platform.h)
     return on;
 }
 
+bool read_player_pad(int, PadState&) { return false; }  // player 1 only on this host
+
 void read_pad(PadState& p) {
     std::lock_guard lk(g_in);
     p.buttons |= g_pad_buttons.buttons;

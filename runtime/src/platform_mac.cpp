@@ -332,58 +332,114 @@ const InputOptions& input_options() {
     return o;
 }
 
-SDL_Gamepad* g_gamepad = nullptr;
+SDL_Gamepad* g_gamepad = nullptr;  // player 1's controller: the settings screen's name and icons, and rumble
 
-static void sample_input() {
-    PadState p;
-    const InputOptions& opt = input_options();
-    SDL_Gamepad*& pad = g_gamepad;
-    static uint64_t next_scan = 0;  // no controller: look for one 4 times a second, not on every loop
-    if (!pad && monotonic_ns() >= next_scan) {
+// ---- several controllers, one per player (hle_hid.cpp reads players 2.. through read_player_pad) ---------------
+
+namespace {
+SDL_Gamepad* g_pads[kMaxPlayers] = {};  // the controller that holds each player
+PadState g_players[kMaxPlayers];        // players 2..: their last sample, under g_pad_lock
+bool g_player_on[kMaxPlayers] = {};
+}  // namespace
+
+// One controller's buttons and sticks, in the layout chosen in the settings.
+static void read_gamepad(SDL_Gamepad* pad, const InputOptions& opt, PadState& p) {
+    // SDL names buttons by position (south/east/...). Console layout: the game's A is the east button, as on a
+    // Switch controller. Xbox layout: A is the bottom one (confirm where Xbox and PlayStation players expect it).
+    struct Map {
+        SDL_GamepadButton b;
+        uint64_t bit;
+    };
+    static const Map map[] = {
+        {SDL_GAMEPAD_BUTTON_NORTH, kX},          {SDL_GAMEPAD_BUTTON_WEST, kY},
+        {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, kL},  {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, kR},
+        {SDL_GAMEPAD_BUTTON_START, kPlus},       {SDL_GAMEPAD_BUTTON_BACK, kMinus},
+        {SDL_GAMEPAD_BUTTON_LEFT_STICK, kStickL}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, kStickR},
+        {SDL_GAMEPAD_BUTTON_DPAD_LEFT, kLeft},   {SDL_GAMEPAD_BUTTON_DPAD_UP, kUp},
+        {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, kRight}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, kDown},
+    };
+    for (const Map& m : map)
+        if (SDL_GetGamepadButton(pad, m.b)) p.buttons |= m.bit;
+    bool east = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_EAST), south = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH);
+    if (opt.xbox_layout ? south : east) p.buttons |= kA;
+    if (opt.xbox_layout ? east : south) p.buttons |= kB;
+    if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 12000) p.buttons |= kZL;
+    if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 12000) p.buttons |= kZR;
+    auto axis = [&](SDL_GamepadAxis a, bool invert) {
+        int v = SDL_GetGamepadAxis(pad, a);
+        if (v > -opt.deadzone && v < opt.deadzone) return 0;
+        v = std::clamp(v, -kStickMax, kStickMax);
+        return invert ? -v : v;
+    };
+    p.lx = axis(SDL_GAMEPAD_AXIS_LEFTX, false);
+    p.ly = axis(SDL_GAMEPAD_AXIS_LEFTY, true);  // SDL: down is positive; Horizon: up is positive
+    p.rx = axis(SDL_GAMEPAD_AXIS_RIGHTX, false);
+    p.ry = axis(SDL_GAMEPAD_AXIS_RIGHTY, true);
+}
+
+// Controllers join as on the console: one that connects waits, the first to press a button becomes player 1, the
+// next player 2, and so on, and each keeps its player while it stays connected. The press that joins is kept from
+// the game until it is released.
+static void sample_gamepads(const InputOptions& opt, PadState (&players)[kMaxPlayers]) {
+    static std::vector<SDL_Gamepad*> waiting;
+    static bool joining[kMaxPlayers] = {};
+    for (int k = 0; k < kMaxPlayers; k++)
+        if (g_pads[k] && !SDL_GamepadConnected(g_pads[k])) {
+            nx::log("input: player %d's controller disconnected", k + 1);
+            SDL_CloseGamepad(g_pads[k]);
+            g_pads[k] = nullptr;
+        }
+    std::erase_if(waiting, [](SDL_Gamepad* pad) {
+        if (SDL_GamepadConnected(pad)) return false;
+        SDL_CloseGamepad(pad);
+        return true;
+    });
+    static uint64_t next_scan = 0;  // new controllers: looked for 4 times a second, not on every loop
+    if (monotonic_ns() >= next_scan) {
         next_scan = monotonic_ns() + 250'000'000;
         int n = 0;
         SDL_JoystickID* ids = SDL_GetGamepads(&n);
-        if (ids && n > 0) pad = SDL_OpenGamepad(ids[0]);
+        for (int i = 0; ids && i < n; i++) {
+            bool known = false;
+            for (SDL_Gamepad* pad : g_pads) known |= pad && SDL_GetGamepadID(pad) == ids[i];
+            for (SDL_Gamepad* pad : waiting) known |= SDL_GetGamepadID(pad) == ids[i];
+            if (known) continue;
+            if (SDL_Gamepad* pad = SDL_OpenGamepad(ids[i])) {
+                nx::log("input: controller %s, joins on its first button", SDL_GetGamepadName(pad) ? SDL_GetGamepadName(pad) : "?");
+                waiting.push_back(pad);
+            }
+        }
         SDL_free(ids);
-        if (pad) nx::log("input: controller %s", SDL_GetGamepadName(pad) ? SDL_GetGamepadName(pad) : "?");
     }
-    if (pad && !SDL_GamepadConnected(pad)) {
-        SDL_CloseGamepad(pad);
-        pad = nullptr;
+    for (auto it = waiting.begin(); it != waiting.end();) {
+        PadState press;
+        read_gamepad(*it, opt, press);
+        int k = 0;
+        while (k < kMaxPlayers && g_pads[k]) k++;
+        if (!press.buttons || k == kMaxPlayers) {
+            ++it;
+            continue;
+        }
+        g_pads[k] = *it;
+        joining[k] = true;
+        SDL_SetGamepadPlayerIndex(g_pads[k], k);  // the player lights, on controllers that have them
+        nx::log("input: player %d: %s", k + 1, SDL_GetGamepadName(g_pads[k]) ? SDL_GetGamepadName(g_pads[k]) : "?");
+        it = waiting.erase(it);
     }
-    if (pad) {
-        // SDL names buttons by position (south/east/...). Console layout: the game's A is the east button, as on a
-        // Switch controller. Xbox layout: A is the bottom one (confirm where Xbox and PlayStation players expect it).
-        struct Map {
-            SDL_GamepadButton b;
-            uint64_t bit;
-        };
-        static const Map map[] = {
-            {SDL_GAMEPAD_BUTTON_NORTH, kX},          {SDL_GAMEPAD_BUTTON_WEST, kY},
-            {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, kL},  {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, kR},
-            {SDL_GAMEPAD_BUTTON_START, kPlus},       {SDL_GAMEPAD_BUTTON_BACK, kMinus},
-            {SDL_GAMEPAD_BUTTON_LEFT_STICK, kStickL}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, kStickR},
-            {SDL_GAMEPAD_BUTTON_DPAD_LEFT, kLeft},   {SDL_GAMEPAD_BUTTON_DPAD_UP, kUp},
-            {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, kRight}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, kDown},
-        };
-        for (const Map& m : map)
-            if (SDL_GetGamepadButton(pad, m.b)) p.buttons |= m.bit;
-        bool east = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_EAST), south = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH);
-        if (opt.xbox_layout ? south : east) p.buttons |= kA;
-        if (opt.xbox_layout ? east : south) p.buttons |= kB;
-        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 12000) p.buttons |= kZL;
-        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 12000) p.buttons |= kZR;
-        auto axis = [&](SDL_GamepadAxis a, bool invert) {
-            int v = SDL_GetGamepadAxis(pad, a);
-            if (v > -opt.deadzone && v < opt.deadzone) return 0;
-            v = std::clamp(v, -kStickMax, kStickMax);
-            return invert ? -v : v;
-        };
-        p.lx = axis(SDL_GAMEPAD_AXIS_LEFTX, false);
-        p.ly = axis(SDL_GAMEPAD_AXIS_LEFTY, true);  // SDL: down is positive; Horizon: up is positive
-        p.rx = axis(SDL_GAMEPAD_AXIS_RIGHTX, false);
-        p.ry = axis(SDL_GAMEPAD_AXIS_RIGHTY, true);
+    for (int k = 0; k < kMaxPlayers; k++) {
+        if (!g_pads[k]) continue;
+        read_gamepad(g_pads[k], opt, players[k]);
+        if (joining[k] && players[k].buttons) players[k] = PadState{};
+        else joining[k] = false;
     }
+    g_gamepad = g_pads[0];
+}
+
+static void sample_input() {
+    const InputOptions& opt = input_options();
+    PadState players[kMaxPlayers];
+    sample_gamepads(opt, players);
+    PadState& p = players[0];  // player 1: its controller, the keyboard and the settings screen
     // Keyboard: the bindings from config.ini (defaults laid out for ACNH: WASD left stick, IJKL camera, arrows
     // D-pad, Space A, Shift B, X X, F Y, Q/E L/R, Z/C ZL/ZR, Enter +, Esc -).
     // The keys also go to the game as a USB keyboard (hle_hid.cpp). While its text entry takes them, they type and
@@ -446,7 +502,11 @@ static void sample_input() {
     }
     // The settings screen takes the input while it is open (and watches for its Minus + Plus combo).
     bool ui = nx::ui::ui_pad(p.buttons, p.lx, p.ly);
-    if (ui) p = PadState{}, std::memset(usb, 0, sizeof usb), mods = 0;
+    if (ui) {
+        for (PadState& q : players) q = PadState{};
+        std::memset(usb, 0, sizeof usb);
+        mods = 0;
+    }
     nx::plat::set_keyboard(mods, usb);
     // The mouse: its left button touches the console's screen where the picture is (the game's own touch support).
     if (g_window) {
@@ -459,6 +519,7 @@ static void sample_input() {
     }
     std::lock_guard lk(g_pad_lock);
     g_pad = p;
+    for (int k = 1; k < kMaxPlayers; k++) g_players[k] = players[k], g_player_on[k] = g_pads[k] != nullptr;
 }
 
 // ---- settings screen hooks (platform.h) --------------------------------------------------------------------------
@@ -571,6 +632,14 @@ void read_pad(PadState& p) {
     if (g_pad.rx) p.rx = g_pad.rx;
     if (g_pad.ry) p.ry = g_pad.ry;
     input_script(p);
+}
+
+bool read_player_pad(int index, PadState& p) {
+    if (index < 1 || index >= kMaxPlayers) return false;
+    std::lock_guard lk(g_pad_lock);
+    if (!g_player_on[index]) return false;
+    p = g_players[index];
+    return true;
 }
 
 // ---- audio: SDL3 stream, s16 stereo 48 kHz, fed from the queue of submitted buffers ----------------------------
