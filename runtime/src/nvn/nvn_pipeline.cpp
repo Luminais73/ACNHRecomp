@@ -130,8 +130,11 @@ VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, ui
         }
         if (inst_binding && s->stage == ShaderStage::Vertex) {  // draw merging: the block of instance k
             std::vector<uint32_t> patched;
-            if (patch_instance_block(code, inst_binding - 1, inst_step, patched)) code.swap(patched);
-            else log("nvn/vk: shader %s: instance block %u not patched", s->hash.c_str(), inst_binding - 1);
+            uint32_t bindings[2], steps[2], nb = 0;
+            for (uint32_t j = 0; j < 2 && (inst_binding >> 8 * j & 0xff); j++)
+                bindings[nb] = (inst_binding >> 8 * j & 0xff) - 1, steps[nb++] = inst_step >> 16 * j & 0xffff;
+            if (patch_instance_blocks(code, bindings, steps, nb, patched)) code.swap(patched);
+            else log("nvn/vk: shader %s: instance blocks %x not patched", s->hash.c_str(), inst_binding);
         }
         if (s->stage == ShaderStage::Vertex) clip_z_module(s, code);  // NX_CLIP_Z_PATCH (nvn_spirv_clip.cpp)
         nan_coords_module(code);  // nvn_spirv_nan.cpp

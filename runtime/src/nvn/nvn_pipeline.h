@@ -85,8 +85,9 @@ struct PipelineKey {
     // NVN's alpha test, in the fragment module (nvn_spirv_alpha.cpp): NVNalphaFunc 1..7 (0: none) and the reference.
     uint32_t alpha_func = 0;
     float alpha_ref = 0;
-    // Draw merging (nvn_draw.cpp): the vertex module reads set 0 binding inst_binding - 1 at gl_InstanceIndex *
-    // inst_step vec4s further (nvn_spirv_instance.cpp; 0: none).
+    // Draw merging (nvn_draw.cpp): the vertex module reads set 0 binding b at gl_InstanceIndex * step vec4s further
+    // (nvn_spirv_instance.cpp), for up to two blocks: byte j of inst_binding is the j-th block's b + 1 (0: none), and
+    // 16 bits j of inst_step its step.
     uint32_t inst_binding = 0, inst_step = 0;
 };
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout);
@@ -109,6 +110,8 @@ void clip_z_module(const ShaderInfo* s, std::vector<uint32_t>& code);
 bool patch_fragcoord_scale(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);  // nvn_spirv_fragcoord.cpp
 bool fs_reads_fragcoord(const ShaderInfo* fs);
 bool patch_instance_block(const std::vector<uint32_t>& in, uint32_t binding, uint32_t step_vec4, std::vector<uint32_t>& out);
+bool patch_instance_blocks(const std::vector<uint32_t>& in, const uint32_t* bindings, const uint32_t* steps, uint32_t nb,
+                           std::vector<uint32_t>& out);
 bool instance_patchable(const ShaderInfo* vs, uint32_t binding);  // memoized (nvn_pipeline.cpp)  // its SPIR-V has gl_FragCoord (nvn_pipeline.cpp, memoized)
 bool patch_alpha_test(const std::vector<uint32_t>& in, std::vector<uint32_t>& out, uint32_t func, float ref);  // nvn_spirv_alpha.cpp
 bool patch_nan_coords(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);  // nvn_spirv_nan.cpp
