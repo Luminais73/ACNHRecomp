@@ -98,6 +98,9 @@ void replay_cmd(VkCommandBuffer& cb, Targets& st, const Cmd& c, const CmdList& l
     if (c.op == Cmd::SetRenderTargets || c.op == Cmd::CopyTextureToTexture || c.op == Cmd::CopyBufferToTexture ||
         c.op == Cmd::CopyTextureToBuffer)
         (*replay::g_state_gen)++;
+    if (c.op == Cmd::SetRenderTargets || c.op == Cmd::ClearColor || c.op == Cmd::ClearDepthStencil ||
+        c.op == Cmd::CopyTextureToTexture || c.op == Cmd::CopyBufferToTexture || c.op == Cmd::CopyTextureToBuffer)
+        draw_merge_flush();
     switch (c.op) {
         case Cmd::SetRenderTargets: {  // the pass ends only when a draw or clear needs other targets
             static const bool always = std::getenv("NX_TARGETS_BREAK") != nullptr;  // bisecting: the old way

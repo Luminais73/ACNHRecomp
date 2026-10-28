@@ -268,6 +268,7 @@ bool pass_open_on(const Targets& t);
 VkExtent2D pass_extent();
 void pass_begin(VkCommandBuffer cb, const Targets& t);
 void pass_mark_written(uint32_t bits);
+void draw_merge_flush();  // the held-back merged draw, before anything else is recorded (nvn_draw.cpp)
 // nvn_mask_clear.cpp: colour target `slot` of the open pass on `t` cleared to `rgba` in `rect`, only the channels in
 // `mask` (bit 0 r .. 3 a) written, by a fullscreen draw. False (nothing recorded) for integer targets or no pipeline.
 bool mask_clear(VkCommandBuffer cb, const Targets& t, uint32_t slot, uint32_t mask, const float rgba[4],

@@ -146,7 +146,24 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
 // it; and set 2 as the last bind_sets resolved it.
 void sets_keep_texture_set(VkDescriptorSet set);
 VkDescriptorSet sets_texture_set();
-bool sets_cache_enabled();  // NX_SET_CACHE (the fast path needs it)
+bool sets_cache_enabled();
+// bind_sets in two steps: the sets resolved (cached or written) and set 0's dynamic offsets, then bound (unless the
+// command buffer has them bound already). Draw merging (nvn_draw.cpp) compares draws between the two.
+struct ResolvedSets {
+    VkDescriptorSet sets[4] = {};
+    uint32_t noff = 0, offsets[64] = {};
+};
+void sets_resolve(const ProgramLayout& layout, ResolvedSets& r);
+void sets_bind(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayout& layout, const ResolvedSets& r);
+// Set 0's buffer writes as the last sets_resolve compared them (0: more than `max`, or not all buffers), and a new set
+// of the submit's pool written with such writes.
+struct BufferWrite {
+    uint32_t binding = 0;
+    VkDescriptorType type{};
+    VkDescriptorBufferInfo info{};
+};
+uint32_t sets_set0_writes(BufferWrite* out, uint32_t max);
+VkDescriptorSet sets_write_set(VkDescriptorSetLayout layout, const BufferWrite* w, uint32_t n);  // NX_SET_CACHE (the fast path needs it)
 Upload zero_stream();  // 64 zero bytes for vertex binding 15
 // draw_inputs, with 16- and 32-bit indices through dedup_upload.
 bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in);

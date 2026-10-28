@@ -101,15 +101,15 @@ VkShaderStageFlags stage_bit(ShaderStage s) {
 std::recursive_mutex g_module_lock;
 // `alpha_func`, `alpha_ref`: NVN's alpha test in the fragment module (nvn_spirv_alpha.cpp; func 0 none).
 VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, uint32_t unwritten = 0, bool scaled = false,
-                         uint32_t alpha_func = 0, float alpha_ref = 0) {
+                         uint32_t alpha_func = 0, float alpha_ref = 0, uint32_t inst_binding = 0, uint32_t inst_step = 0) {
     std::lock_guard module_lock(g_module_lock);
-    static std::map<std::tuple<const ShaderInfo*, std::string, uint32_t, bool, uint32_t, float>, VkShaderModule> cache;
+    static std::map<std::tuple<const ShaderInfo*, std::string, uint32_t, bool, uint32_t, float, uint64_t>, VkShaderModule> cache;
     // The integer-vertex-input patch (skinned models' bone indices; without it Metal refuses every character's
     // pipeline, DEBUG.md #25/#26). NX_INT_ATTRIBS=0 turns it off.
     static const char* int_env = std::getenv("NX_INT_ATTRIBS");
     static const bool off = int_env && int_env[0] == '0';
     std::string k = kinds && !off ? std::string(reinterpret_cast<const char*>(kinds), 16) : std::string(16, '\0');
-    auto& m = cache[{s, k, unwritten, scaled, alpha_func, alpha_func ? alpha_ref : 0.0f}];
+    auto& m = cache[{s, k, unwritten, scaled, alpha_func, alpha_func ? alpha_ref : 0.0f, uint64_t(inst_binding) << 32 | inst_step}];
     if (!m) {
         const uint64_t module_t0 = plat::monotonic_ns();
         bool is_patched = false;
@@ -127,6 +127,11 @@ VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, ui
             std::vector<uint32_t> patched;
             if (patch_alpha_test(code, patched, alpha_func, alpha_ref)) code.swap(patched);
             else log("nvn/vk: shader %s: alpha test %u not patched", s->hash.c_str(), alpha_func);
+        }
+        if (inst_binding && s->stage == ShaderStage::Vertex) {  // draw merging: the block of instance k
+            std::vector<uint32_t> patched;
+            if (patch_instance_block(code, inst_binding - 1, inst_step, patched)) code.swap(patched);
+            else log("nvn/vk: shader %s: instance block %u not patched", s->hash.c_str(), inst_binding - 1);
         }
         if (s->stage == ShaderStage::Vertex) clip_z_module(s, code);  // NX_CLIP_Z_PATCH (nvn_spirv_clip.cpp)
         nan_coords_module(code);  // nvn_spirv_nan.cpp
@@ -403,6 +408,7 @@ struct PipeBuild {
         bool scaled = false;
         uint32_t alpha_func = 0;
         float alpha_ref = 0;
+        uint32_t inst_binding = 0, inst_step = 0;
     } modules[2];
 };
 
@@ -465,7 +471,8 @@ VkPipeline compile(PipeBuild& b) {
     for (uint32_t k = 0; k < b.nstages; k++)
         if (!b.stages[k].module && b.modules[k].s) {
             const auto& mr = b.modules[k];
-            b.stages[k].module = module_of(mr.s, mr.has_kinds ? mr.kinds : nullptr, mr.unwritten, mr.scaled, mr.alpha_func, mr.alpha_ref);
+            b.stages[k].module = module_of(mr.s, mr.has_kinds ? mr.kinds : nullptr, mr.unwritten, mr.scaled, mr.alpha_func, mr.alpha_ref,
+                                         mr.inst_binding, mr.inst_step);
         }
     const bool stats = pipe_stats_wanted(b.fs_hash);
     if (stats)
@@ -737,6 +744,19 @@ bool fs_reads_fragcoord(const ShaderInfo* fs) {
     return memo[fs] = patch_fragcoord_scale(code, unused);
 }
 
+bool instance_patchable(const ShaderInfo* vs, uint32_t binding) {
+    static PerThread<std::map<std::pair<const ShaderInfo*, uint32_t>, bool>*> front_pt;
+    auto*& front = *front_pt;
+    if (!front) front = new std::map<std::pair<const ShaderInfo*, uint32_t>, bool>();
+    if (auto f = front->find({vs, binding}); f != front->end()) return f->second;
+    static std::map<std::pair<const ShaderInfo*, uint32_t>, bool> memo;
+    std::lock_guard lk(cache_mutex());
+    if (auto it = memo.find({vs, binding}); it != memo.end()) return (*front)[{vs, binding}] = it->second;
+    std::lock_guard module_lock(g_module_lock);
+    std::vector<uint32_t> code = vs ? patched_spirv(vs, nullptr, 0, nullptr) : std::vector<uint32_t>(), unused;
+    return (*front)[{vs, binding}] = memo[{vs, binding}] = vs && patch_instance_block(code, binding, 1, unused);
+}
+
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout) {
     // By the key's bytes, as before, but hashed (nvn_pipeline.h) instead of a ~700-byte std::string built and
     // compared down a tree per draw; and the last entry first: consecutive draws mostly share their state.
@@ -899,6 +919,7 @@ PipelineKey canonical_key(const PipelineKey& in) {
     k.fc_x = in.fc_x;
     k.fc_off = in.fc_off;
     if (in.fs && in.alpha_func >= 1 && in.alpha_func <= 7) k.alpha_func = in.alpha_func, k.alpha_ref = in.alpha_ref;
+    k.inst_binding = in.inst_binding, k.inst_step = in.inst_binding ? in.inst_step : 0;
     return k;
 }
 
@@ -938,6 +959,7 @@ std::unique_ptr<PipeBuild> prepare_graphics_pipeline(const PipelineKey& key, con
         auto& mr = B.modules[nstages - 1];  // made in compile(), off the replay thread when that is asynchronous
         mr.s = s, mr.unwritten = s == key.fs ? unwritten : 0, mr.scaled = scaled;
         if (s == key.fs) mr.alpha_func = key.alpha_func, mr.alpha_ref = key.alpha_ref;
+        if (s == key.vs) mr.inst_binding = key.inst_binding, mr.inst_step = key.inst_step;
         if (s == key.vs && int_kinds) std::memcpy(mr.kinds, int_kinds, sizeof mr.kinds), mr.has_kinds = true;
         st.pName = "main";
         if (scaled) {  // screen scale: constants 0 and 1 of the patched vertex module (nvn_ultrawide.cpp)

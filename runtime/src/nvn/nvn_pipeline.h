@@ -85,6 +85,9 @@ struct PipelineKey {
     // NVN's alpha test, in the fragment module (nvn_spirv_alpha.cpp): NVNalphaFunc 1..7 (0: none) and the reference.
     uint32_t alpha_func = 0;
     float alpha_ref = 0;
+    // Draw merging (nvn_draw.cpp): the vertex module reads set 0 binding inst_binding - 1 at gl_InstanceIndex *
+    // inst_step vec4s further (nvn_spirv_instance.cpp; 0: none).
+    uint32_t inst_binding = 0, inst_step = 0;
 };
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout);
 // Under NX_ASYNC_PIPELINES, whether the next graphics_pipeline may skip its draw while the pipeline compiles: only a
@@ -104,7 +107,9 @@ bool depth_remap();  // NX_CLIP_Z_PATCH: clip z -w..w mapped in the vertex shade
 bool patch_clip_z(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);  // nvn_spirv_clip.cpp
 void clip_z_module(const ShaderInfo* s, std::vector<uint32_t>& code);
 bool patch_fragcoord_scale(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);  // nvn_spirv_fragcoord.cpp
-bool fs_reads_fragcoord(const ShaderInfo* fs);  // its SPIR-V has gl_FragCoord (nvn_pipeline.cpp, memoized)
+bool fs_reads_fragcoord(const ShaderInfo* fs);
+bool patch_instance_block(const std::vector<uint32_t>& in, uint32_t binding, uint32_t step_vec4, std::vector<uint32_t>& out);
+bool instance_patchable(const ShaderInfo* vs, uint32_t binding);  // memoized (nvn_pipeline.cpp)  // its SPIR-V has gl_FragCoord (nvn_pipeline.cpp, memoized)
 bool patch_alpha_test(const std::vector<uint32_t>& in, std::vector<uint32_t>& out, uint32_t func, float ref);  // nvn_spirv_alpha.cpp
 bool patch_nan_coords(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);  // nvn_spirv_nan.cpp
 void nan_coords_module(std::vector<uint32_t>& code);  // NaN texture coordinates read texel 0, as on Maxwell             // patch_clip_z if depth_remap

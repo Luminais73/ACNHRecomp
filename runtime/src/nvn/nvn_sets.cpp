@@ -358,6 +358,7 @@ struct Descriptors {
     std::vector<VkDescriptorBufferInfo> buffers;
     std::vector<VkDescriptorImageInfo> images;
     std::vector<SetWrite> key;  // scratch for the set cache
+    std::vector<SetWrite> key0;  // set 0's writes as the last resolve_sets compared them (draw merging)
     uint64_t dynamic = 0;              // set 0 bindings given a dynamic offset (ProgramLayout::dynamic)
     uint32_t dynamic_offset[64] = {};  // their ring offsets, by binding
 };
@@ -424,6 +425,7 @@ void resolve_sets(const ProgramLayout& layout) {
                 h = (h ^ v) * 0x100000001B3ull, h ^= h >> 31;
             d.key.push_back(e);
         }
+        if (k == 0) d.key0 = d.key;
         d.sets[k] = VK_NULL_HANDLE;
         if (d.key.empty()) continue;
         CachedSet* slot = nullptr;
@@ -686,25 +688,68 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
 // sets build_sets allocated are bound, in ascending order (each bind leaves the lower sets, bound with this same
 // layout, undisturbed).
 bool sets_cache_enabled() { return set_cache_on(); }
+uint32_t sets_set0_writes(BufferWrite* out, uint32_t max) {
+    const Descriptors& d = *g_sets;
+    if (d.key0.size() > max) return 0;
+    uint32_t n = 0;
+    for (const SetWrite& e : d.key0) {
+        const VkDescriptorType t = VkDescriptorType(e.type);
+        if (t != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && t != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
+            t != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && t != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+            return 0;
+        BufferWrite& w = out[n++];
+        w.binding = e.binding, w.type = t;
+        std::memcpy(&w.info.buffer, &e.a, sizeof w.info.buffer);
+        w.info.offset = e.b, w.info.range = e.c;
+    }
+    return n;
+}
+
+VkDescriptorSet sets_write_set(VkDescriptorSetLayout layout, const BufferWrite* w, uint32_t n) {
+    VkDescriptorSet set = descriptor_set(layout);
+    if (!set) return VK_NULL_HANDLE;
+    VkWriteDescriptorSet writes[64];
+    n = std::min<uint32_t>(n, 64);
+    for (uint32_t i = 0; i < n; i++) {
+        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[i].dstSet = set, writes[i].dstBinding = w[i].binding, writes[i].descriptorCount = 1;
+        writes[i].descriptorType = w[i].type, writes[i].pBufferInfo = &w[i].info;
+    }
+    if (n) p_vkUpdateDescriptorSets(vk_device(), n, writes, 0, nullptr);
+    return set;
+}
 void sets_keep_texture_set(VkDescriptorSet set) { *g_keep_set2 = set; }
 VkDescriptorSet sets_texture_set() { return (*g_sets).sets[2]; }
 
 void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayout& layout) {
+    ResolvedSets r;
+    sets_resolve(layout, r);
+    sets_bind(cb, point, layout, r);
+}
+
+void sets_resolve(const ProgramLayout& layout, ResolvedSets& r) {
     Descriptors& d = (*g_sets);
     if (set_cache_on()) resolve_sets(layout);
     *g_keep_set2 = VK_NULL_HANDLE;
     draw_part(8);
     if (!d.writes.empty()) p_vkUpdateDescriptorSets(vk_device(), uint32_t(d.writes.size()), d.writes.data(), 0, nullptr);
     draw_part(9);
+    std::memcpy(r.sets, d.sets, sizeof r.sets);
     // Set 0's dynamic offsets, in binding order (every dynamic binding of the layout; one no stage wrote: 0).
-    uint32_t offsets[64];
-    uint32_t noff = 0;
+    r.noff = 0;
     for (uint64_t m = layout.dynamic; m; m &= m - 1) {
         uint32_t b = uint32_t(__builtin_ctzll(m));
-        offsets[noff++] = d.dynamic >> b & 1 ? d.dynamic_offset[b] : 0;
+        r.offsets[r.noff++] = d.dynamic >> b & 1 ? d.dynamic_offset[b] : 0;
     }
+}
+
+void sets_bind(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayout& layout, const ResolvedSets& r) {
+    const uint32_t* offsets = r.offsets;
+    const uint32_t noff = r.noff;
     if (draw_slow(kSlowEmptySets)) {
-        p_vkCmdBindDescriptorSets(cb, point, layout.layout, 0, 4, d.sets, noff, offsets);
+        VkDescriptorSet sets[4];
+        std::memcpy(sets, r.sets, sizeof sets);
+        p_vkCmdBindDescriptorSets(cb, point, layout.layout, 0, 4, sets, noff, offsets);
         return;
     }
     // The same sets and offsets as this command buffer's last bind: not bound again. Turnip re-fetches every
@@ -723,23 +768,23 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
     static const bool skip = !(std::getenv("NX_BIND_SKIP") && std::getenv("NX_BIND_SKIP")[0] == '0');
     const uint64_t gen = bound_generation();
     if (skip && last.gen == gen && last.cb == cb && last.layout == layout.layout && last.point == point && last.noff == noff &&
-        std::memcmp(last.sets, d.sets, sizeof last.sets) == 0 &&
+        std::memcmp(last.sets, r.sets, sizeof last.sets) == 0 &&
         std::memcmp(last.offsets, offsets, noff * sizeof(uint32_t)) == 0) {
         (*g_binds_kept)++;
         return;
     }
     last.cb = cb, last.layout = layout.layout, last.point = point, last.noff = noff, last.gen = gen;
-    std::memcpy(last.sets, d.sets, sizeof last.sets);
+    std::memcpy(last.sets, r.sets, sizeof last.sets);
     std::memcpy(last.offsets, offsets, noff * sizeof(uint32_t));
     (*g_binds_made)++;
     for (uint32_t k = 0; k < 4;) {
-        if (!d.sets[k]) {
+        if (!r.sets[k]) {
             k++, (*g_sets_skipped)++;
             continue;
         }
         uint32_t n = 1;
-        while (k + n < 4 && d.sets[k + n]) n++;
-        p_vkCmdBindDescriptorSets(cb, point, layout.layout, k, n, d.sets + k, k == 0 ? noff : 0, offsets);
+        while (k + n < 4 && r.sets[k + n]) n++;
+        p_vkCmdBindDescriptorSets(cb, point, layout.layout, k, n, r.sets + k, k == 0 ? noff : 0, offsets);
         k += n;
     }
 }

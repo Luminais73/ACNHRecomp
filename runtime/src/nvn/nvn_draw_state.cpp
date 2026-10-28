@@ -26,7 +26,7 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
         case Cmd::BindDeferred:
             if (c.mask <= 1) (*g_state_gen)++;  // textures, images (2, 3: uniform and storage buffers)
             break;
-        default: (*g_state_gen)++; break;
+        default: (*g_state_gen)++, draw_merge_flush(); break;
     }
     auto blob = [&](size_t size) -> const uint8_t* {
         return c.blob < list.blobs.size() && list.blobs[c.blob].size() >= size ? list.blobs[c.blob].data() : nullptr;

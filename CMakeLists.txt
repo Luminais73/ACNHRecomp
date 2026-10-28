@@ -227,6 +227,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_spirv_clip.cpp
     runtime/src/nvn/nvn_spirv_nan.cpp
     runtime/src/nvn/nvn_spirv_fragcoord.cpp
+    runtime/src/nvn/nvn_spirv_instance.cpp
     runtime/src/nvn/nvn_spirv_alpha.cpp
     runtime/src/nvn/nvn_vk_defer.cpp
     runtime/src/nvn/nvn_ultrawide.cpp

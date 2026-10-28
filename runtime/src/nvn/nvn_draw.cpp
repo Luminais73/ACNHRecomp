@@ -308,16 +308,9 @@ void draw_part(int k) {
 }
 namespace {
 
-// The end of a draw, shared by the full path and the fast path: vertex buffers, viewport and scissor (scaled to a
-// screen target), the draw itself, and what it wrote.
-void draw_issue(VkCommandBuffer cb, const Targets& t, bool indexed, const Cmd& c, const DrawInputs& in,
-                const ShaderInfo* vs, const ShaderInfo* fs, float ui_x) {
-    // The vertex buffers resolved above, plus the zero stream (binding 15).
-    for (uint32_t s = 0; s < 15; s++)
-        if (in.used >> s & 1) bind_vertex(cb, s, in.vertex[s]);
-    bind_vertex(cb, 15, zero_stream());
-
-    VkViewport vp{0, 0, float((*g_pass_extent).width), float((*g_pass_extent).height), 0, 1};
+// The draw's viewport and scissor: the guest's, scaled to a screen target.
+void draw_viewport(float ui_x, VkViewport& vp, VkRect2D& sc) {
+    vp = VkViewport{0, 0, float((*g_pass_extent).width), float((*g_pass_extent).height), 0, 1};
     if ((*g_state).has_viewport)
         vp = {float((*g_state).viewport[0]), float((*g_state).viewport[1]), float((*g_state).viewport[2]),
               float((*g_state).viewport[3]), (*g_state).depth_near, (*g_state).depth_far};
@@ -326,7 +319,7 @@ void draw_issue(VkCommandBuffer cb, const Targets& t, bool indexed, const Cmd& c
     // (Before this, the front face was inverted instead: triangles were culled right, but every render target was
     // upside down, which the post chain undid in some scenes and not in others: the first course showed a
     // mirrored sky.)
-    VkRect2D sc{{0, 0}, (*g_pass_extent)};
+    sc = VkRect2D{{0, 0}, (*g_pass_extent)};
     if ((*g_state).has_scissor)
         sc = {{std::max(0, (*g_state).scissor[0]), std::max(0, (*g_state).scissor[1])},
               {uint32_t(std::max(0, (*g_state).scissor[2])), uint32_t(std::max(0, (*g_state).scissor[3]))}};
@@ -359,6 +352,20 @@ void draw_issue(VkCommandBuffer cb, const Targets& t, bool indexed, const Cmd& c
         }
     }
     vp.y += vp.height, vp.height = -vp.height;
+}
+
+// The end of a draw, shared by the full path and the fast path: vertex buffers, viewport and scissor (scaled to a
+// screen target), the draw itself (unless `emit` is false: draw merging records it later), and what it wrote.
+void draw_issue(VkCommandBuffer cb, const Targets& t, bool indexed, const Cmd& c, const DrawInputs& in,
+                const ShaderInfo* vs, const ShaderInfo* fs, float ui_x, bool emit = true) {
+    // The vertex buffers resolved above, plus the zero stream (binding 15).
+    for (uint32_t s = 0; s < 15; s++)
+        if (in.used >> s & 1) bind_vertex(cb, s, in.vertex[s]);
+    bind_vertex(cb, 15, zero_stream());
+
+    VkViewport vp;
+    VkRect2D sc;
+    draw_viewport(ui_x, vp, sc);
     set_dynamic(cb, vp, sc);
 
     trace_skin(indexed, c, vs, fs);
@@ -378,11 +385,11 @@ void draw_issue(VkCommandBuffer cb, const Targets& t, bool indexed, const Cmd& c
             (*g_bound).has_index = true, (*g_bound).index = in.index, (*g_bound).index_type = in.index_type, (*g_state_set)++;
         }
         bool q = zero_draws_on() && zero_draws_begin(cb, vs->hash + " " + (fs ? fs->hash : std::string("-")));
-        p_vkCmdDrawIndexed(cb, count, uint32_t(std::max(1, c.i[3])), 0, c.i[1], uint32_t(c.i[2]));
+        if (emit) p_vkCmdDrawIndexed(cb, count, uint32_t(std::max(1, c.i[3])), 0, c.i[1], uint32_t(c.i[2]));
         if (q) zero_draws_end(cb);
     } else {
         bool q = zero_draws_on() && zero_draws_begin(cb, vs->hash + " " + (fs ? fs->hash : std::string("-")));
-        p_vkCmdDraw(cb, uint32_t(c.i[1]), uint32_t(std::max(1, c.i[3])), uint32_t(c.i[0]), uint32_t(c.i[2]));
+        if (emit) p_vkCmdDraw(cb, uint32_t(c.i[1]), uint32_t(std::max(1, c.i[3])), uint32_t(c.i[0]), uint32_t(c.i[2]));
         if (q) zero_draws_end(cb);
     }
     (*g_stats).done++;
@@ -407,6 +414,8 @@ struct Prepared {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorSet set2 = VK_NULL_HANDLE;
     float ui_x = 0;
+    PipelineKey key{};      // the pipeline's key (draw merging builds the instanced variant from it)
+    bool merge_ok = false;  // no per-instance vertex streams: its draws may be merged
     struct Tex {
         Texture* tex;
         GpuImage* img;
@@ -421,6 +430,150 @@ struct Prepared {
 };
 PerThread<Prepared> g_prep;
 PerThread<uint64_t> g_fast_hits, g_fast_misses;
+
+// Draw merging (docs/PARALLEL_REPLAY.md): on the island ~95% of the fast path's draws repeat the previous draw's mesh,
+// state and viewport and differ only in one uniform block of the vertex shader (an object's transform), which the
+// ring holds at a constant step: ~22 draws a run. Turnip's fixed cost per draw (~3.5 us of GPU time) made those runs
+// most of the frame's GPU time. The run becomes one instanced draw: the first draw binds everything and its
+// vkCmdDraw is held back; each next draw that would bind the same things but that block, `step` bytes further, only
+// counts; at the end of the run (anything else recorded, see merge_flush's callers) the block is bound once over the
+// whole run and the vertex module reads instance k's copy (nvn_spirv_instance.cpp). Instances are drawn in order, as
+// the draws were. NX_DRAW_MERGE=0: off (on by default on Android).
+struct Merge {
+    bool on = false;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    uint64_t bound_gen = 0;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const Prepared* prep = nullptr;
+    bool indexed = false;
+    int32_t i[3] = {};
+    DrawInputs in;
+    VkViewport vp{};
+    VkRect2D sc{};
+    ResolvedSets sets;
+    BufferWrite writes[64];
+    uint32_t nwrites = 0;
+    uint32_t n = 0, slot = 0, binding = 0, step = 0, range = 0;
+};
+PerThread<Merge> g_merge;
+PerThread<uint64_t> g_merge_runs, g_merge_draws, g_merge_fallbacks;
+PerThread<uint64_t[20]> g_merge_why;  // NX_MERGE_WHY: why fast draws did not extend a run
+
+bool merge_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_DRAW_MERGE");
+#if defined(__ANDROID__)
+        if (!e) return !parallel_replay_on();
+#endif
+        return e && e[0] == '1' && !parallel_replay_on();
+    }();
+    return on;
+}
+
+void merge_emit(const Merge& m, uint32_t instances) {
+    if (m.indexed) p_vkCmdDrawIndexed(m.cb, uint32_t(m.i[0]), instances, 0, m.i[1], 0);
+    else p_vkCmdDraw(m.cb, uint32_t(m.i[1]), instances, uint32_t(m.i[0]), 0);
+}
+
+// Records the held-back draw (or run): before anything else is recorded into its command buffer.
+void merge_flush() {
+    Merge& m = *g_merge;
+    if (!m.on) return;
+    m.on = false;
+    if (m.n == 1) return merge_emit(m, 1);
+    (*g_merge_runs)++, (*g_merge_draws) += m.n;
+    const ProgramLayout& layout = *m.prep->layout;
+    PipelineKey key = m.prep->key;
+    key.inst_binding = m.binding + 1, key.inst_step = m.step / 16;
+    pipeline_skip_allowed(true);  // still compiling: the run is drawn draw by draw meanwhile
+    VkPipeline p = graphics_pipeline(key, layout);
+    VkDescriptorSet s0 = VK_NULL_HANDLE;
+    if (p) {
+        BufferWrite w[64];
+        std::memcpy(w, m.writes, m.nwrites * sizeof(BufferWrite));
+        for (uint32_t k = 0; k < m.nwrites; k++)
+            if (w[k].binding == m.binding) w[k].info.range = uint64_t(m.n - 1) * m.step + m.range;
+        s0 = sets_write_set(layout.sets[0], w, m.nwrites);
+    }
+    if (p && s0) {
+        p_vkCmdBindPipeline(m.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+        (*g_bound).pipeline = p;
+        p_vkCmdBindDescriptorSets(m.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.layout, 0, 1, &s0, m.sets.noff, m.sets.offsets);
+        merge_emit(m, m.n);
+    } else {
+        (*g_merge_fallbacks)++;
+        merge_emit(m, 1);  // the first draw's sets are bound
+        uint32_t offsets[64];
+        std::memcpy(offsets, m.sets.offsets, m.sets.noff * sizeof(uint32_t));
+        for (uint32_t k = 1; k < m.n; k++) {
+            offsets[m.slot] = m.sets.offsets[m.slot] + k * m.step;
+            p_vkCmdBindDescriptorSets(m.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.layout, 0, 1, &m.sets.sets[0],
+                                      m.sets.noff, offsets);
+            merge_emit(m, 1);
+        }
+    }
+    (*g_bound_gen)++;  // set 0 is not what bind_sets' repeat check last bound
+}
+
+// Whether this fast draw only continues the held-back run (`rs`, `vp`, `sc`: what it would bind and set).
+bool merge_extends(VkCommandBuffer cb, const Prepared& prep, bool indexed, const Cmd& c, const DrawInputs& in,
+                   const ResolvedSets& rs, const VkViewport& vp, const VkRect2D& sc) {
+    Merge& m = *g_merge;
+    auto why = [](int k) { (*g_merge_why)[k]++; return false; };
+    if (!m.on || m.cb != cb || m.prep != &prep || m.pipeline != prep.pipeline || (*g_bound).pipeline != m.pipeline ||
+        (*g_bound_gen) != m.bound_gen || m.indexed != indexed || c.i[0] != m.i[0] || c.i[1] != m.i[1] ||
+        c.i[2] != 0 || c.i[3] > 1 || in.used != m.in.used || rs.noff != m.sets.noff)
+        return why(1);
+    if (indexed && (in.index.buffer != m.in.index.buffer || in.index.offset != m.in.index.offset ||
+                    in.index_type != m.in.index_type))
+        return why(2);
+    for (uint32_t s = 0; s < 15; s++)
+        if ((in.used >> s & 1) && (in.vertex[s].buffer != m.in.vertex[s].buffer || in.vertex[s].offset != m.in.vertex[s].offset))
+            return why(3);
+    if (std::memcmp(&vp, &m.vp, sizeof vp) != 0 || std::memcmp(&sc, &m.sc, sizeof sc) != 0 ||
+        std::memcmp(rs.sets, m.sets.sets, sizeof rs.sets) != 0)
+        return why(4);
+    uint32_t slot = UINT32_MAX;
+    for (uint32_t k = 0; k < rs.noff; k++)
+        if (rs.offsets[k] != m.sets.offsets[k]) {
+            if (slot != UINT32_MAX) return why(5);  // two blocks move
+            slot = k;
+        }
+    if (slot == UINT32_MAX) return why(6);
+    const int64_t step = int64_t(rs.offsets[slot]) - int64_t(m.sets.offsets[slot]);
+    if (m.n == 1) {  // the run's second draw: which block, and may it be read by instance
+        if (step <= 0 || step % 16 || step > 0x8000) return why(7);
+        uint32_t b = 0;
+        for (uint64_t d = prep.layout->dynamic, k = 0;; d &= d - 1, k++) {
+            if (!d) return why(8);
+            if (k == slot) {
+                b = uint32_t(__builtin_ctzll(d));
+                break;
+            }
+        }
+        const ShaderInfo* vs = prep.vs;
+        if (!vs->masks_known || !vs->uniform_extent[b] || (dynamic_uniform_bindings(vs) >> b & 1)) return why(9);
+        bool in_vs = false;
+        for (const DescriptorBinding& db : vs->refl.bindings) in_vs |= db.set == 0 && db.binding == b;
+        if (!in_vs) return why(10);
+        if (prep.fs)
+            for (const DescriptorBinding& db : prep.fs->refl.bindings)
+                if (db.set == 0 && db.binding == b) return why(11);
+        uint32_t range = 0;
+        for (uint32_t k = 0; k < m.nwrites; k++)
+            if (m.writes[k].binding == b) range = uint32_t(m.writes[k].info.range);
+        // Reads past the block return 0 (robust buffer access, as on Maxwell): only a block read within its range.
+        if (!range) return why(12);
+        if (vs->uniform_extent[b] > range) return why(13);
+        if (!instance_patchable(vs, b)) return why(19);
+        m.slot = slot, m.binding = b, m.step = uint32_t(step), m.range = range;
+    } else if (slot != m.slot || step != int64_t(m.n) * m.step) {
+        return why(13);
+    }
+    if (uint64_t(m.n) * m.step + m.range > 0x10000) return why(14);  // maxUniformBufferRange
+    m.n++;
+    return true;
+}
 
 bool fast_draw_on() {
     static const bool on = [] {
@@ -476,42 +629,42 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         if (*t_bail) return give_up();
         if (!*g_rendering) begin_rendering(cb, prep.tt);  // a written range's copy ended the pass
         if (*t_bail) return give_up();
-        if ((*g_bound).cb != cb) (*g_bound) = Bound{}, (*g_bound_gen)++, (*g_bound).cb = cb;
+        if ((*g_bound).cb != cb) merge_flush(), (*g_bound) = Bound{}, (*g_bound_gen)++, (*g_bound).cb = cb;
+        ResolvedSets rs;
+        sets_resolve(*prep.layout, rs);
+        const bool merging = prep.merge_ok && merge_on();
+        if (!merging) (*g_merge_why)[prep.merge_ok ? 16 : 17]++;
+        if (merging) {
+            VkViewport vp;
+            VkRect2D sc;
+            draw_viewport(prep.ui_x, vp, sc);
+            if (merge_extends(cb, prep, indexed, c, in, rs, vp, sc)) {
+                (*g_stats).done++;
+                return true;
+            }
+            merge_flush();
+        }
         if ((*g_bound).pipeline != prep.pipeline) {
             p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, prep.pipeline);
             (*g_bound).pipeline = prep.pipeline, (*g_state_set)++;
         }
-        bind_sets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, *prep.layout);
-        draw_issue(cb, t, indexed, c, in, prep.vs, prep.fs, prep.ui_x);
-        {  // NX_MERGE_PROBE: how many fast draws repeat the previous draw's mesh (could be one instanced draw)
-            static const bool probe = std::getenv("NX_MERGE_PROBE") != nullptr;
-            if (probe) {
-                struct Mesh {
-                    VkCommandBuffer cb;
-                    int32_t i[4];
-                    uint32_t used;
-                    Upload v[16], idx;
-                    bool indexed;
-                };
-                static Mesh last{};
-                static uint64_t same = 0, total = 0, runs = 0;
-                Mesh m{cb, {c.i[0], c.i[1], c.i[2], c.i[3]}, in.used, {}, in.index, indexed};
-                for (uint32_t s = 0; s < 16; s++) m.v[s] = in.vertex[s];
-                bool rep = last.cb == cb && std::memcmp(m.i, last.i, sizeof m.i) == 0 && m.used == last.used &&
-                           m.indexed == last.indexed && std::memcmp(&m.idx, &last.idx, sizeof(Upload)) == 0 &&
-                           std::memcmp(m.v, last.v, sizeof m.v) == 0 && c.i[3] <= 1;
-                same += rep, total++, runs += !rep;
-                last = m;
-                if (total >= 300000) {
-                    log("merge probe: %.1f%% of fast draws repeat the previous mesh (%.1f draws a run)",
-                        100.0 * double(same) / double(total), double(total) / double(runs));
-                    same = total = runs = 0;
-                }
-            }
+        sets_bind(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, *prep.layout, rs);
+        const bool hold = merging && c.i[2] == 0 && c.i[3] <= 1;  // may start a run: its vkCmdDraw held back
+        if (merging && !hold) (*g_merge_why)[18]++;
+        draw_issue(cb, t, indexed, c, in, prep.vs, prep.fs, prep.ui_x, !hold);
+        if (hold) {
+            Merge& m = *g_merge;
+            m.on = true, m.cb = cb, m.bound_gen = *g_bound_gen, m.pipeline = prep.pipeline, m.prep = &prep;
+            m.indexed = indexed, m.i[0] = c.i[0], m.i[1] = c.i[1], m.i[2] = c.i[2];
+            m.in = in, m.sets = rs, m.n = 1;
+            m.nwrites = sets_set0_writes(m.writes, 64);
+            draw_viewport(prep.ui_x, m.vp, m.sc);
+            if (!m.nwrites) merge_flush();
         }
         return true;
     }
     (*g_fast_misses)++;
+    merge_flush();
     prep.valid = false;
     sets_keep_texture_set(VK_NULL_HANDLE);  // never left over into a full build
     bool data_dep = false;  // the draw's resolution read vertex data (a UI quad's size): not prepared for the next
@@ -847,6 +1000,9 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         prep.shaders = shaders, prep.vs = vs, prep.fs = fs, prep.layout = &layout, prep.pipeline = pipeline;
         prep.set2 = sets_texture_set();
         prep.ui_x = ui_x;
+        prep.key = key;
+        prep.merge_ok = true;
+        for (uint32_t s = 0; s < 16; s++) prep.merge_ok &= key.streams[s].divisor == 0;
         prep.textures.clear(), prep.handles.clear();
         const DrawTextures& dt = *g_textures;
         for (size_t k = 0; k < dt.resolved.size(); k++) {
@@ -960,6 +1116,16 @@ void draw_log_stats() {
             (unsigned long long)(*g_fast_hits + *g_fast_misses),
             100.0 * double(*g_fast_hits) / double(*g_fast_hits + *g_fast_misses));
     *g_fast_hits = *g_fast_misses = 0;
+    if (*g_merge_runs)
+        log("nvn: draw merging: %llu draws in %llu instanced draws (%.1f a draw), %llu runs drawn one by one (pipeline "
+            "compiling)", (unsigned long long)*g_merge_draws, (unsigned long long)*g_merge_runs,
+            double(*g_merge_draws) / double(*g_merge_runs), (unsigned long long)*g_merge_fallbacks);
+    *g_merge_runs = *g_merge_draws = *g_merge_fallbacks = 0;
+    if (std::getenv("NX_MERGE_WHY")) {
+        std::string w;
+        for (int k = 0; k < 20; k++) w += " " + std::to_string((*g_merge_why)[k]), (*g_merge_why)[k] = 0;
+        log("nvn: draw merging refused by reason:%s", w.c_str());
+    }
     if ((*g_vertex_barriers)) log("nvn passes: %llu vertex-read barriers (G4)", (unsigned long long)(*g_vertex_barriers));
     dedup_log();
     render_pass_log();
@@ -988,6 +1154,7 @@ void draw_log_stats() {
 
 void pass_end_only(VkCommandBuffer cb, int reason) {
     if (!(*g_rendering)) return;
+    merge_flush();
     (*g_pass_ends)[reason & 7]++, trace_pass("end: reason", (*g_pass), uint32_t(reason), 0);
     if ((*g_render_pass))
         p_vkCmdEndRenderPass(cb);
@@ -1033,6 +1200,7 @@ void pass_begin(VkCommandBuffer cb, const Targets& t) { begin_rendering(cb, t); 
 // After a clear inside the pass (nvn_clears.cpp). A masked one is a fullscreen draw with its own pipeline, viewport
 // and scissor (nvn_mask_clear.cpp): the next draw sets everything again.
 uint64_t bound_generation() { return *g_bound_gen; }
+void draw_merge_flush() { merge_flush(); }
 void pass_mark_written(uint32_t bits) { (*g_pass_written) |= bits, (*g_bound) = Bound{}, (*g_bound_gen)++; }
 
 bool replay::pass_wrote(const GpuImage* img) {
