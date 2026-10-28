@@ -222,6 +222,7 @@ uint64_t g_dump_draws = 0, g_dump_request = 0;
 void dispatch(VkCommandBuffer cb, const Cmd& c) {
     static const bool off = std::getenv("NX_NO_COMPUTE") != nullptr;  // debug: skip compute dispatches
     if (off) return;
+    sets_keep_texture_set(VK_NULL_HANDLE);  // the draw fast path's set 2 is a graphics layout's
     const auto* shaders = program_shaders((*g_state).program);
     const ShaderInfo* cs = nullptr;
     if (shaders)
@@ -458,17 +459,23 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     if (prep.valid && prep.gen == *g_state_gen && prep.cb == cb && prep.mode == mode && *g_rendering &&
         targets_same(prep.t, t) && fast_draw_on() && prepared_holds(prep)) {
         (*g_fast_hits)++;
+        // The kept set 2 is for this draw's bind_sets only: every way out before it drops it (left set, the next
+        // build_sets, of another layout or a dispatch, would bind it: a GPU fault).
+        auto give_up = [] {
+            sets_keep_texture_set(VK_NULL_HANDLE);
+            return false;
+        };
         sets_keep_texture_set(prep.set2);
         build_sets(cb, *prep.shaders, *prep.layout);
-        if (*t_bail) return false;
+        if (*t_bail) return give_up();
         DrawInputs in;
         if (!draw_inputs_shared(cb, prep.vs, indexed, c, in)) {
             (*g_stats).no_indices++;
-            return false;
+            return give_up();
         }
-        if (*t_bail) return false;
+        if (*t_bail) return give_up();
         if (!*g_rendering) begin_rendering(cb, prep.tt);  // a written range's copy ended the pass
-        if (*t_bail) return false;
+        if (*t_bail) return give_up();
         if ((*g_bound).cb != cb) (*g_bound) = Bound{}, (*g_bound_gen)++, (*g_bound).cb = cb;
         if ((*g_bound).pipeline != prep.pipeline) {
             p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, prep.pipeline);
@@ -476,10 +483,37 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         }
         bind_sets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, *prep.layout);
         draw_issue(cb, t, indexed, c, in, prep.vs, prep.fs, prep.ui_x);
+        {  // NX_MERGE_PROBE: how many fast draws repeat the previous draw's mesh (could be one instanced draw)
+            static const bool probe = std::getenv("NX_MERGE_PROBE") != nullptr;
+            if (probe) {
+                struct Mesh {
+                    VkCommandBuffer cb;
+                    int32_t i[4];
+                    uint32_t used;
+                    Upload v[16], idx;
+                    bool indexed;
+                };
+                static Mesh last{};
+                static uint64_t same = 0, total = 0, runs = 0;
+                Mesh m{cb, {c.i[0], c.i[1], c.i[2], c.i[3]}, in.used, {}, in.index, indexed};
+                for (uint32_t s = 0; s < 16; s++) m.v[s] = in.vertex[s];
+                bool rep = last.cb == cb && std::memcmp(m.i, last.i, sizeof m.i) == 0 && m.used == last.used &&
+                           m.indexed == last.indexed && std::memcmp(&m.idx, &last.idx, sizeof(Upload)) == 0 &&
+                           std::memcmp(m.v, last.v, sizeof m.v) == 0 && c.i[3] <= 1;
+                same += rep, total++, runs += !rep;
+                last = m;
+                if (total >= 300000) {
+                    log("merge probe: %.1f%% of fast draws repeat the previous mesh (%.1f draws a run)",
+                        100.0 * double(same) / double(total), double(total) / double(runs));
+                    same = total = runs = 0;
+                }
+            }
+        }
         return true;
     }
     (*g_fast_misses)++;
     prep.valid = false;
+    sets_keep_texture_set(VK_NULL_HANDLE);  // never left over into a full build
     bool data_dep = false;  // the draw's resolution read vertex data (a UI quad's size): not prepared for the next
     const auto* shaders = program_shaders((*g_state).program);
     if (!shaders || shaders->empty()) {

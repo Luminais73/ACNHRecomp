@@ -62,7 +62,7 @@ struct Mode {
 };
 const Mode kModes[3] = {
     {"performance", 1.0, 1.0, 1.0, 0, 0, 99.0f, 999, 0, 0.0},
-    {"balanced", 0.85, 0.80, 0.03, 400, 1200, 0.90f, 75, 1, 0.85},
+    {"balanced", 0.85, 0.80, 0.03, 441, 1200, 0.90f, 81, 1, 0.85},
     // Cool trades a little: the GPU nearly full, a few late frames, and the ceilings two steps down when hot.
     {"cool", 0.96, 0.88, 0.08, 305, 1000, 0.75f, 68, 2, 0.95},
 };
