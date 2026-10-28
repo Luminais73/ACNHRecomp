@@ -429,6 +429,8 @@ bool pick_result(std::string& path) {
     return true;
 }
 
+bool read_player_pad(int, PadState&) { return false; }  // player 1 only on this host
+
 void read_pad(PadState& p) {
     {
         std::lock_guard lk(g_pad_lock);
