@@ -71,7 +71,8 @@ Whether you're playing, helping test builds across different hardware, or follow
   sharpness, wider aspect ratios (16:10, 21:9, 32:9 and phone ratios), windowed or fullscreen.
 - **Controllers:** any controller SDL3 recognises (Xbox, PlayStation, Switch Pro Controller / Joy-Con, generic
   pads), a Switch or Xbox/PlayStation confirm-button layout, and in-game button icons redrawn for Xbox,
-  PlayStation or Switch. Fully remappable keyboard controls.
+  PlayStation or Switch. Fully remappable keyboard controls. **Party Play** on macOS and Linux: up to four
+  controllers, one per player, joining as on the console (the first to press a button is player 1).
 - **Mouse and keyboard:** the mouse works as the console's touch screen (window buttons, list items and dialogue
   choices take a click; a click while a message waits advances it), and the PC keyboard types names and messages
   wherever the game's text entry is open.
@@ -120,8 +121,8 @@ GPU; see [docs/STATUS.md](docs/STATUS.md) for the full, regularly updated log.
 |---|---|
 | Linux x86-64 | Tested (Ubuntu, clang 21, Intel Iris Xe / Mesa ANV) |
 | macOS (Apple Silicon, MoltenVK) | Tested (M1, macOS 26/27, Homebrew's MoltenVK) |
-| Windows x86-64 | Builds with `tools/setup_acnh.py` (clang-cl, SDL3); contributed by a fork, not tested here |
-| Android (Snapdragon, Turnip) | Tested (Galaxy S20 FE / Snapdragon 865: 26-30 fps, shown doubled with frame generation). The app holds no game and is in the releases; it asks for the game folder your computer prepares from your own game, see [docs/ANDROID.md](docs/ANDROID.md) |
+| Windows x86-64 | Builds with `tools/setup_acnh.py` (clang-cl, SDL3); the launcher is in the releases. Contributed by a fork, not fully tested here |
+| Android (Snapdragon, Turnip) | Tested (Galaxy S20 FE / Snapdragon 865: a steady 30 fps drawn at 900 rows and upscaled with FSR 1 to the screen, battery under ~41 °C after 20 minutes; frame generation optional). The app holds no game and is in the releases; it asks for the game folder your computer prepares from your own game, see [docs/ANDROID.md](docs/ANDROID.md) |
 
 ## Disclaimer
 
@@ -141,7 +142,14 @@ via Claude Code), directed and tested by a person. Its base, SuperMarioWonderRec
 
 ### Your game folder
 
-A folder with the game's executables and files from your own copy, laid out as an ExeFS + RomFS dump:
+A folder with the game's executables and files from your own copy, laid out as an ExeFS + RomFS dump.
+
+> **ACNHRecomp-Importer is required to make it.** This repository only reads a game folder that is already
+> prepared; making one from your own dump of the game is the job of **ACNHRecomp-Importer**, a separate companion
+> project that is **available on our Discord** ([discord.gg/VJW9Dtdu7a](https://discord.gg/VJW9Dtdu7a)). Get it
+> there, run it on your own copy, and point the launcher (or `tools/setup_acnh.py --game`) at the folder it writes.
+
+The folder's layout:
 
 | Path | Contents | Required |
 |---|---|---|
@@ -187,6 +195,21 @@ lz4, zstandard, fonttools, cmake, ninja, unicorn), Vulkan-Headers 1.4.357, the .
 has .NET 10), the Ryubing shader translator source and Dear ImGui.
 
 ## Installation
+
+### Downloads
+
+The [releases](https://github.com/Nycolazs/ACNHRecomp/releases) have, for each version, none of them with any part
+of the game:
+
+| File | What it is |
+|---|---|
+| `ACNHRecomp-<version>-windows-x64.zip` | The sources with the launcher already built: unzip, double-click `Start ACNHRecomp.bat` |
+| `ACNHRecomp-<version>-macOS-arm64.zip` | The sources with the launcher already built: unzip, double-click `Start ACNHRecomp.command` |
+| `ACNHRecomp-<version>-android.apk` | The Android app; it plays the game folder your computer prepares ([docs/ANDROID.md](docs/ANDROID.md)) |
+| `libvulkan_freedreno.so` | The Turnip Vulkan driver (Mesa, MIT) the Android setup installs |
+
+The launcher then asks for your game folder (made with ACNHRecomp-Importer, see
+[Your game folder](#your-game-folder)), checks the computer and recompiles the game from your own files.
 
 ### With the launcher (recommended)
 

@@ -2,8 +2,8 @@
 
 ACNHRecomp runs on Android phones with a Snapdragon (Adreno 6xx or newer), through Turnip (Mesa's Vulkan driver
 for Adreno, carried inside the app). It was brought up and tuned on a Galaxy S20 FE (Snapdragon 865, Adreno 650):
-on the island the game holds its own 30 frames a second and the phone shows 60 with the built-in frame generation,
-at 900 rendered rows scaled to the 2400x1080 screen (the full 20:9 screen, under the camera cutout).
+on the island the game holds a steady 30 frames a second at 900 rendered rows, upscaled with AMD FSR 1 to the
+2400x1080 screen (the full 20:9 screen, under the camera cutout), with the battery under ~41 °C after 20 minutes.
 
 The app holds **nothing of the game**: it is the runtime only (a few MB), the same for everyone, and the releases
 of this repository carry it ready to install. The game itself comes from **your own copy**: your computer
@@ -88,15 +88,20 @@ Open **ACNH Recomp** on the phone. The first start takes a minute or two: shader
   top corners; - and + at the top centre with the settings gear between them; a small d-pad bottom left.
 - **A controller** (Bluetooth or USB) hides the touch controls by itself while it is connected. The settings can
   also hide them for good.
-- **Settings**: the gear at the top centre (or Minus + Plus on a controller). Language (pt-BR included), aspect,
-  resolution, frame generation, frame rate. On a phone they show no keyboard hints.
+- **Settings**: the gear at the top centre (or Minus + Plus on a controller); drag a finger over a page to scroll
+  it. Language (pt-BR included), aspect, resolution, upscaling, frame generation, frame rate. Resolution, aspect,
+  upscaling (FSR or bilinear), its sharpness, anti-aliasing, frame generation, the FPS counter and the thermal mode
+  apply at once; a setting that only applies when the game starts again says so under it, and *Restart now* at the
+  bottom starts the game again. The FPS counter shows the game's own frames a second (and, with frame generation,
+  the pictures shown). On a phone they show no keyboard hints.
 
 ### Settings that matter on a phone
 
 | Setting | Default on Android | Notes |
 |---|---|---|
-| Frame generation | Built-in | the game's 30 fps shown at 60; off: 30 |
-| Resolution | Auto | the rows the GPU keeps at 30 fps (900 on an Adreno 650), scaled to the screen |
+| Frame generation | Off | built-in: the game's 30 fps shown at 60, ~4 ms more GPU a frame, warmer, and what moves past something else smears every other picture (no motion vectors from the game) |
+| Resolution | Auto | the rows the GPU keeps at 30 fps (900 on an Adreno 650) |
+| Upscaling | AMD FSR 1 | from those rows to the screen; bilinear is a little cheaper and softer |
 | Aspect | Auto | the phone's own shape (20:9), HUD at the edges |
 | Prepare shaders while loading / async shaders | on | new objects can show a few frames late instead of freezing the game |
 | Thermal mode | Balanced | see below |
@@ -127,7 +132,14 @@ how warm the phone may get (runtime/src/thermal.cpp):
 Every cap written is put back when the game goes to the background and when it ends (the root shell restores them
 when the app's end of its socket closes: also after a crash or a kill).
 
-## Measured (Galaxy S20 FE, island, 900 rows, frame generation)
+## Measured (Galaxy S20 FE, island)
+
+20 minutes of walking, menus and talking at the game's noon, 900 rows + FSR 1, frame generation off (2026-10-28):
+30.3 game frames a second on average, no two-second window under 30, 7 hitches; the battery at most 40.3 °C, the
+CPU 72-78 °C. With frame generation on: 30.4 (60 shown), 122 hitches, battery 41.7 °C, CPU 78-86 °C. At 1080 rows
+the GPU is at its limit once Samsung's thermal manager caps it to 400 MHz (27-30 fps when the room is warm).
+
+Earlier (900 rows, frame generation):
 
 | | Before (2026-10-26) | Now |
 |---|---|---|
