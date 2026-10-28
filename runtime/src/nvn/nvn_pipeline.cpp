@@ -1360,6 +1360,11 @@ VkImageView storage_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
         v.levels = 1, v.swizzle = 0;  // storage views: one level, identity
         if (VkImageView iv = view_of(*img, view_type(shape), v)) return iv;
     }
+    if (img && !img->storage) {
+        static int logged = 0;
+        if (logged++ < 10) log("nvn/vk: texture %llx bound as a storage image without storage usage (flags %#x): not written",
+                               (unsigned long long)texture, get<Texture>(texture) ? get<Texture>(texture)->flags : 0u);
+    }
     static std::map<VkImageViewType, GpuImage> dummies;
     VkImageViewType type = view_type(shape);
     auto& d = dummies[type];

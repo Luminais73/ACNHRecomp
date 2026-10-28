@@ -234,7 +234,19 @@ GpuImage* image_of(uint64_t guest) {
     {
         VkFormatProperties fp{};
         p_vkGetPhysicalDeviceFormatProperties(vk_physical(), ci.format, &fp);
-        img->storage = !compressed && !aspect && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+        // Storage only for textures made with NVN_TEXTURE_FLAGS_IMAGE (4: the game's image load/store needs it): on
+        // Adreno 6xx Turnip keeps no framebuffer compression (UBWC) on an image with STORAGE usage, and every colour
+        // target had it. NX_STORAGE_ALL=1: every colour image, as before.
+        static const bool all = [] {
+            const char* e = std::getenv("NX_STORAGE_ALL");
+#if defined(__ANDROID__)
+            return e && e[0] == '1';
+#else
+            return !(e && e[0] == '0');
+#endif
+        }();
+        img->storage = !compressed && !aspect && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
+                       (all || (t->flags & 4));
         if (img->storage) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     }
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
