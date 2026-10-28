@@ -45,7 +45,7 @@ std::atomic<float> g_wanted_k{1.0f};      // g_wanted.k (cameras: the frames the
 
 // The environment (scripts, presets) wins over config.ini, which the settings screen changes while the game runs.
 std::string setting(const char* env, const char* key, const char* fallback) {
-    if (const char* e = std::getenv(env); e && *e) return e;
+    if (const char* e = config_env_override(env)) return e;  // set before the game; NX_AA from config.ini is not
     return config_get(key, fallback);
 }
 

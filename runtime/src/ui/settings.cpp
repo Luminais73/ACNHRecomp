@@ -74,6 +74,18 @@ void toast(const std::string& text) {
 
 // ---- settings helpers -----------------------------------------------------------------------------------------
 
+// Whether a setting waits for the game to start again. On phones the picture's upscaling, sharpness, anti-aliasing and
+// frame generation are read while the game runs (nvn_present.cpp, nvn_framegen.cpp); elsewhere they are not (the
+// desktop's present pass is chosen at start).
+bool needs_restart(const std::string& key) {
+#if defined(__ANDROID__)
+    for (const char* k : {"video.upscaler", "video.fsr_sharpness_pct", "video.antialiasing", "video.frame_gen"})
+        if (key == k) return false;
+#endif
+    return config_needs_restart(key);
+}
+
+std::string g_row_key;  // the setting the row's control changes (combo, toggle, slider set it): its restart tag
 void apply_live(const std::string& key, const std::string& value) {
     if (key == "video.fullscreen") plat::set_fullscreen(value == "1");
     else if (key == "video.show_fps") {
@@ -103,7 +115,7 @@ void apply_live(const std::string& key, const std::string& value) {
     }
     else if (key == "audio.volume") plat::set_master_volume(std::clamp(std::atoi(value.c_str()), 0, 100) / 100.0f);
     else if (key == "ui.language") ui_set_language(value);
-    if (config_needs_restart(key)) g_restart_note = true;
+    if (needs_restart(key)) g_restart_note = true;
 }
 
 void store(const std::string& key, const std::string& value) {
@@ -140,11 +152,23 @@ void row(const char* label, const char* desc, const std::function<void(float wid
     }
     ImGui::PopTextWrapPos();
     ImGui::EndGroup();
+    const ImVec2 text_min = ImGui::GetItemRectMin(), text_max = ImGui::GetItemRectMax();
     if (!narrow) {
         ImGui::SameLine(avail - ctrl_w + ImGui::GetStyle().WindowPadding.x * 0.0f);
     }
     ImGui::SetNextItemWidth(ctrl_w);
+    g_row_key.clear();
     control(ctrl_w);
+    // A setting that waits for the game to start again says so under the row's text and control.
+    if (!g_row_key.empty() && needs_restart(g_row_key)) {
+        const float y = std::max(text_max.y, ImGui::GetItemRectMax().y) + 3.0f * g_scale;
+        ImGui::SetCursorScreenPos(ImVec2(text_min.x, y));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.66f, 0.42f, 0.18f, 1));
+        ImGui::SetWindowFontScale(0.86f);
+        ImGui::TextUnformatted(tr("common.on_restart"));
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::PopStyleColor();
+    }
     ImGui::PopID();
     ImGui::Dummy(ImVec2(0, 4.0f * g_scale));
     ImGui::PushStyleColor(ImGuiCol_Separator, ImGui::GetStyle().Colors[ImGuiCol_Border]);
@@ -156,6 +180,7 @@ void row(const char* label, const char* desc, const std::function<void(float wid
 using Choices = std::vector<std::pair<std::string, std::string>>;  // value, shown text (already translated)
 
 void combo(const std::string& key, const std::string& fallback, const Choices& choices, float width) {
+    g_row_key = key;
     std::string cur = config_get(key, fallback);
     std::string shown = cur;
     int cur_idx = -1;
@@ -208,6 +233,7 @@ void combo(const std::string& key, const std::string& fallback, const Choices& c
 
 // An on/off pill like the game's.
 void toggle(const std::string& key, bool fallback, float width = 0) {
+    g_row_key = key;
     bool on = config_get_bool(key, fallback);
     float h = ImGui::GetFrameHeight(), pill_w = h * 1.9f;
     const char* label = tr(on ? "common.on" : "common.off");
@@ -265,6 +291,7 @@ void toggle(const std::string& key, bool fallback, float width = 0) {
 bool g_slider_held = false;  // a slider under the finger this frame: it takes the drag, the page does not scroll
 
 void slider(const std::string& key, int lo, int hi, int fallback, const char* fmt, float width) {
+    g_row_key = key;
     int v = config_get_int(key, fallback);
     ImGui::SetNextItemWidth(width);
     const bool changed = ImGui::SliderInt("##s", &v, lo, hi, fmt);

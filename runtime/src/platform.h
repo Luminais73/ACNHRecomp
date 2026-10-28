@@ -156,6 +156,7 @@ void frame_helper_tick();  // a helper thread of the frame, placed with the game
 // The host thread id of a role (0 replay+present, 1 game main) as last seen by frame_thread_tick, 0 before (sampler.cpp).
 uint64_t frame_thread_id(int role);
 void frame_presented();  // after each present to the display
+uint64_t game_frames();  // the game's frames presented so far (not the repeats or generated ones): the FPS counter
 // Linux: asks power-profiles-daemon for its performance profile for as long as this process lives (frame_stats.cpp).
 void request_performance_profile();
 // Write watches (write_watch.cpp; page protection, POSIX): add fails when unsupported or full; take re-arms and

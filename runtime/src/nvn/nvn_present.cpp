@@ -7,6 +7,7 @@
 //   final image has no meaningful alpha.
 // NX_PRESENT_PASS=1 turns it on (FSR and FXAA do too), =0 off (the blit).
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -198,35 +199,47 @@ struct Pass {
     VkImageView inter_view = VK_NULL_HANDLE;
     VkFramebuffer inter_fb = VK_NULL_HANDLE;
     uint32_t inter_w = 0, inter_h = 0;
-    bool fsr_logged = false;
+    bool fsr_logged = false, fsr_failed = false;
     // FXAA (video.antialiasing = fxaa, NX_AA=fxaa): the main pass with tools/shaders/aa/fxaa.frag; not with FSR.
     VkPipeline fxaa = VK_NULL_HANDLE;
-    bool fxaa_logged = false;
+    bool fxaa_logged = false, fxaa_failed = false;
 } g;
 
+// FSR, FXAA and the sharpening are read while the game runs (the settings screen changes them, video.upscaler,
+// video.antialiasing, video.fsr_sharpness_pct): a variable set before the game (NX_FSR, NX_AA, NX_FSR_SHARP) wins.
+template <class T, class F>
+T live_setting(std::atomic<uint64_t>& gen, std::atomic<T>& value, F&& read) {
+    const uint64_t g = config_generation();
+    if (gen.load(std::memory_order_acquire) != g) value.store(read(), std::memory_order_relaxed), gen.store(g, std::memory_order_release);
+    return value.load(std::memory_order_relaxed);
+}
+
 bool fsr_on() {
-    static const bool on = [] {
-        const char* e = std::getenv("NX_FSR");
-        if (e) return e[0] == '1';
+    static std::atomic<uint64_t> gen{~0ull};
+    static std::atomic<bool> v{false};
+    return live_setting(gen, v, [] {
+        if (const char* e = config_env_override("NX_FSR")) return e[0] == '1';
         return config_get("video.upscaler", plat::kDefaultUpscaler) == "fsr";  // phones: on (platform.h)
-    }();
-    return on;
+    });
 }
 
 bool fxaa_on() {
-    static const bool on = [] {
-        const char* e = std::getenv("NX_AA");
-        return e && std::strcmp(e, "fxaa") == 0;
-    }();
-    return on;
+    static std::atomic<uint64_t> gen{~0ull};
+    static std::atomic<bool> v{false};
+    return live_setting(gen, v, [] {
+        if (const char* e = config_env_override("NX_AA")) return std::strcmp(e, "fxaa") == 0;
+        return config_get("video.antialiasing", "off") == "fxaa";
+    });
 }
 
 float fsr_sharpness() {  // stops of sharpening: 0 the most, 2 none (FSR's own default is 0.2)
-    static const float v = [] {
-        const char* e = std::getenv("NX_FSR_SHARP");
-        return e ? std::max(0.0f, std::min(2.0f, float(std::atof(e)))) : 0.2f;
-    }();
-    return v;
+    static std::atomic<uint64_t> gen{~0ull};
+    static std::atomic<float> v{0.2f};
+    return live_setting(gen, v, [] {
+        if (const char* e = config_env_override("NX_FSR_SHARP")) return std::max(0.0f, std::min(2.0f, float(std::atof(e))));
+        const int pct = std::clamp(std::atoi(config_get("video.fsr_sharpness_pct", "80").c_str()), 0, 100);
+        return float(100 - pct) / 50.0f;  // as config.cpp's fsr_sharpness
+    });
 }
 
 // The intermediate image for a picture of w x h pixels on the target, made again when the size changes.
@@ -524,9 +537,13 @@ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop,
     }
 
     // FSR 1: upscale the shown part into `inter` (the picture's size on the target), then sharpen it in the main pass.
+    // FSR and FXAA turned on in the settings while the game runs: their pipelines are made now.
+    const bool fsr = fsr_on(), fxaa = !fsr && fxaa_on();
+    if (fsr && !g.easu && !g.fsr_failed && !(g.fsr_failed = !make_fsr())) g.fsr_logged = false;
+    if (fxaa && !g.fxaa && !g.fxaa_failed) g.fxaa_failed = !build_pipeline(g.render_pass, kFxaa, sizeof kFxaa, &g.fxaa);
     uint32_t out_w = uint32_t(bw * tw + 0.5f), out_h = uint32_t(bh * th + 0.5f);
     VkDescriptorSet rcas_set = VK_NULL_HANDLE;
-    if (g.easu && g.rcas && r == 0 && out_w > cw * 1.01f && out_h > ch * 1.01f && fsr_inter(out_w, out_h)) {
+    if (fsr && g.easu && g.rcas && r == 0 && out_w > cw * 1.01f && out_h > ch * 1.01f && fsr_inter(out_w, out_h)) {
         if (!g.fsr_logged)
             log("nvn/vk: FSR 1: %.0fx%.0f -> %ux%u (sharpness %.2f stops)", cw, ch, out_w, out_h, fsr_sharpness()),
                 g.fsr_logged = true;
@@ -562,9 +579,9 @@ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop,
     VkRect2D sc{{0, 0}, g.extent};
     p_vkCmdSetViewport(cb, 0, 1, &v);
     p_vkCmdSetScissor(cb, 0, 1, &sc);
-    if (!rcas_set && g.fxaa && !g.fxaa_logged)
+    if (!rcas_set && fxaa && g.fxaa && !g.fxaa_logged)
         log("nvn/vk: FXAA: %.0fx%.0f -> %ux%u", cw, ch, out_w, out_h), g.fxaa_logged = true;
-    p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rcas_set ? g.rcas : g.fxaa ? g.fxaa : g.pipeline);
+    p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rcas_set ? g.rcas : fxaa && g.fxaa ? g.fxaa : g.pipeline);
     VkDescriptorSet main_set = rcas_set ? rcas_set : set;
     p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &main_set, 0, nullptr);
     p_vkCmdPushConstants(cb, g.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);

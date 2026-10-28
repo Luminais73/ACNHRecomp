@@ -295,37 +295,26 @@ void feed_input(ImGuiIO& io) {
 }
 
 void draw_fps_overlay(float scale) {
+    // The game's own frames a second (plat::game_frames: not the 30 fps repeats on a 60 Hz screen nor the generated
+    // frames, which made it read 60 while the game ran at 30), and the pictures shown when frame generation adds some.
     using clock = std::chrono::steady_clock;
-    static auto last_present = clock::now();
-    static float s_fps = 0.0f;
-    static int s_frames = 0;
-    static float s_accum_sec = 0.0f;
-
-    auto now = clock::now();
-    float dt = std::chrono::duration<float>(now - last_present).count();
-    last_present = now;
-
-    if (dt > 0.0f && dt < 0.5f) {
-        s_accum_sec += dt;
-        s_frames++;
-        if (s_accum_sec >= 0.25f) {
-            s_fps = float(s_frames) / s_accum_sec;
-            s_accum_sec = 0.0f;
-            s_frames = 0;
-        }
-    } else {
-        s_accum_sec = 0.0f;
-        s_frames = 0;
+    static auto last = clock::now();
+    static uint64_t frames0 = plat::game_frames(), shown = 0;
+    static float s_fps = 0.0f, s_shown = 0.0f;
+    shown++;
+    const auto now = clock::now();
+    const float dt = std::chrono::duration<float>(now - last).count();
+    if (dt >= 1.0f) {  // a second: steadier than the 0.25 s it was
+        const uint64_t frames = plat::game_frames();
+        s_fps = float(frames - frames0) / dt, s_shown = float(shown) / dt;
+        frames0 = frames, shown = 0, last = now;
     }
-
-    if (s_fps <= 0.0f) {
-        ImGuiIO& io = ImGui::GetIO();
-        s_fps = io.Framerate > 0.0f ? io.Framerate : 30.0f;
-    }
-
     ImGuiIO& io = ImGui::GetIO();
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%.1f FPS", s_fps);
+    char buf[96];
+    if (config_get("video.frame_gen", "off") == "builtin" && s_shown > s_fps * 1.5f)
+        std::snprintf(buf, sizeof(buf), tr("ui.fps_generated"), s_fps, s_shown);
+    else
+        std::snprintf(buf, sizeof(buf), "%.1f FPS", s_fps);
     const ImVec2 ts = ImGui::CalcTextSize(buf);
     const ImVec2 pad(10.0f * scale, 5.0f * scale);
     const float margin = 12.0f * scale;

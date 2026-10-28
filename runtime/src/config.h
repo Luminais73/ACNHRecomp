@@ -28,6 +28,9 @@ bool config_get_bool(const std::string& key, bool fallback);
 void config_set(const std::string& key, const std::string& value);
 std::vector<ConfigEntry> config_all();
 uint64_t config_generation();          // bumped by every config_set: readers cache by it
+// The variable's value when it was set before the game (config.txt, a script, a test): it wins over the setting.
+// nullptr when unset or set by config_apply from config.ini (then the setting itself is read, live).
+const char* config_env_override(const char* name);
 bool config_show_fps();                 // whether the on-screen FPS counter is shown (video.show_fps / NX_SHOW_FPS)
 bool config_is_handheld();               // whether handheld mode (1280x720) is active (video.mode / NX_HANDHELD)
 // The keys and values of a video.preset ("quality", "balanced", "low"); empty for "custom" or an unknown name.

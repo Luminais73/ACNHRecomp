@@ -224,7 +224,11 @@ void frame_thread_tick(int role) {
     r.wall_from = now, r.cpu_from = cpu_ns;
 }
 
+std::atomic<uint64_t> g_game_frames{0};
+uint64_t game_frames() { return g_game_frames.load(std::memory_order_relaxed); }
+
 void frame_presented() {
+    g_game_frames.fetch_add(1, std::memory_order_relaxed);
     frame_thread_tick(0);
     static uint64_t last = 0, n = 0, bins[7] = {};
     uint64_t now = monotonic_ns();

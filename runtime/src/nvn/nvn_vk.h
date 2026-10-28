@@ -89,6 +89,7 @@ bool present_pass_failed();   // the pass could not be made: frames are blitted,
 GpuImage* present_pass_test_target();  // NX_PRESENT_TEST: an offscreen "display" for the pass (headless dumps)
 // nvn_framegen.cpp: built-in frame generation (NX_FRAMEGEN=1): an in-between frame for each real one, shown first.
 bool framegen_wanted();
+void framegen_update();  // nvn_framegen.cpp: the setting read again (once a present)
 bool framegen_frame_begin(uint64_t now_ns);  // per real frame: whether to make one this time (the pace allows it)
 uint64_t framegen_real_delay_ns();           // how long after the in-between frame the real one is shown
 // `src` (window texture `texture`) noted as the last frame; with `generate` and the last frame still there, the frame

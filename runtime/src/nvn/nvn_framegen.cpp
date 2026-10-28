@@ -19,9 +19,11 @@
 // GPU time per generated frame is measured with timestamps and logged ("nvn/fg:"): ~1.2-1.8 ms at 1080p on an Intel
 // Iris Xe.
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
+#include "config.h"
 #include "nvn_vk.h"
 #include "platform.h"
 
@@ -286,23 +288,33 @@ void collect_slot() {
 
 }  // namespace
 
-bool framegen_wanted() {
-    static const bool on = [] {
-        const char* e = std::getenv("NX_FRAMEGEN");
-        // Off by default everywhere: block matching without the game's motion vectors smears what moves against what
-        // moves behind it (the player running past flowers and bushes, every other refresh: it looked like flicker),
-        // and on a Snapdragon 865 it costs ~4 ms of GPU a frame and ~6 C. video.frame_gen = builtin turns it on.
-        if (!e || e[0] != '1') return false;
-        // 60 presents a second already (video.frame_rate = 60): nothing to fill in.
-        const char* i = std::getenv("NX_PRESENT_INTERVAL");
-        if (i && std::atoi(i) == 1) {
-            log("nvn/fg: the game presents at 60 fps (NX_PRESENT_INTERVAL=1): frame generation off");
-            return false;
-        }
-        return true;
-    }();
-    return on && (!g.tried || g.ok);
+// Read again at each present (framegen_update, nvn_vk.cpp gpu_present): the settings screen turns it on and off while
+// the game runs; one frame's presents all see the same answer. NX_FRAMEGEN set before the game wins.
+std::atomic<bool> g_fg_on{false};
+
+void framegen_update() {
+    static uint64_t gen = ~0ull;
+    const uint64_t now = config_generation();
+    if (now == gen) return;
+    gen = now;
+    // Off by default everywhere: block matching without the game's motion vectors smears what moves against what
+    // moves behind it (the player running past flowers and bushes, every other refresh: it looked like flicker),
+    // and on a Snapdragon 865 it costs ~4 ms of GPU a frame and ~6 C. video.frame_gen = builtin turns it on.
+    bool on;
+    if (const char* e = config_env_override("NX_FRAMEGEN")) on = e[0] == '1';
+    else on = config_get("video.frame_gen", "off") == "builtin";
+    // 60 presents a second already (video.frame_rate = 60): nothing to fill in.
+    const char* i = std::getenv("NX_PRESENT_INTERVAL");
+    if (on && i && std::atoi(i) == 1) {
+        static bool logged = false;
+        if (!logged) log("nvn/fg: the game presents at 60 fps (NX_PRESENT_INTERVAL=1): frame generation off"), logged = true;
+        on = false;
+    }
+    if (on != g_fg_on.load(std::memory_order_relaxed)) log("nvn/fg: frame generation %s", on ? "on" : "off");
+    g_fg_on.store(on, std::memory_order_relaxed);
 }
+
+bool framegen_wanted() { return g_fg_on.load(std::memory_order_relaxed) && (!g.tried || g.ok); }
 
 bool framegen_frame_begin(uint64_t now_ns) {
     uint64_t dt = g.last_ns ? now_ns - g.last_ns : 0;

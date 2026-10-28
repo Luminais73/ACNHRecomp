@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <set>
 
 #include <nx/runtime.h>
 
@@ -35,6 +36,8 @@ ConfigEntry* find(const std::string& key) {
     return nullptr;
 }
 
+std::set<std::string> g_env_from_config;  // the variables config_apply set (under g_lock): not overrides
+
 void set_env_default(const char* name, const std::string& value) {
     if (std::getenv(name)) return;  // set by hand or by a preset: it wins
 #if defined(_WIN32)
@@ -42,9 +45,11 @@ void set_env_default(const char* name, const std::string& value) {
 #else
     setenv(name, value.c_str(), 0);
 #endif
+    g_env_from_config.insert(name);
 }
 
 void unset_env(const char* name) {
+    g_env_from_config.insert(name);  // config_apply's doing: not an override either
 #if defined(_WIN32)
     _putenv_s(name, "");  // an empty value removes the variable
 #else
@@ -311,6 +316,13 @@ bool config_get_bool(const std::string& key, bool fallback) {
 
 uint64_t config_generation() { return g_generation.load(std::memory_order_acquire); }
 
+const char* config_env_override(const char* name) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return nullptr;
+    std::lock_guard lk(g_lock);
+    return g_env_from_config.count(name) ? nullptr : e;
+}
+
 bool config_show_fps() {
     static std::atomic<uint64_t> s_last_gen{0};
     static std::atomic<bool> s_cached{false};
@@ -339,7 +351,10 @@ bool config_is_handheld() {
 }
 
 void config_set(const std::string& key, const std::string& value) {
-    g_generation.fetch_add(1, std::memory_order_acq_rel);
+    // The generation goes up once the value is in (below): a reader that sees the new one reads the new value.
+    struct Bump {
+        ~Bump() { g_generation.fetch_add(1, std::memory_order_acq_rel); }
+    } bump;
     std::lock_guard lk(g_lock);
     if (ConfigEntry* e = find(key))
         e->value = value;

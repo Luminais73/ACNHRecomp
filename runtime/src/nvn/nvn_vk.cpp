@@ -439,10 +439,17 @@ bool make_swapchain() {
     ci.surface = g_surface;
     // With frame generation two images are queued per game frame: with three, acquiring the next one waited for the
     // display (~14 ms a frame on a Snapdragon 865), and the replay thread, which presents, could not go on with the
-    // next frame meanwhile. Five keep a free image. NX_SWAP_IMAGES: the count.
+    // next frame meanwhile. Five keep a free image, also for the 30 fps repeat without it, and frame generation can be
+    // turned on while the game runs. NX_SWAP_IMAGES: the count.
     static const unsigned want = [] {
         const char* e = std::getenv("NX_SWAP_IMAGES");
-        return e && std::atoi(e) > 0 ? unsigned(std::atoi(e)) : framegen_wanted() ? 5u : 3u;
+        if (e && std::atoi(e) > 0) return unsigned(std::atoi(e));
+#if defined(__ANDROID__)
+        return 5u;
+#else
+        framegen_update();
+        return framegen_wanted() ? 5u : 3u;
+#endif
     }();
     ci.minImageCount = std::max(caps.minImageCount, want);
     if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
@@ -1115,11 +1122,14 @@ void present_image(const int32_t* crop, Record&& record) {
         end_and_wait(acquired, rendered);
     // Handed to the presenter thread: game frames, and on Android without frame generation their repeats too.
 #if defined(__ANDROID__)
-    const bool handed = presenter_wanted() && (real || !framegen_wanted());
+    const bool handed = presenter_wanted() && (real || !framegen_wanted()), fence_own = handed && real;
 #else
-    const bool handed = presenter_wanted() && real;
+    const bool handed = presenter_wanted() && real, fence_own = false;
 #endif
-    if (!real && presenter_wanted() && framegen_wanted()) {  // a fence behind the generated image (see g_gen_fence)
+    // A fence behind the generated image (see g_gen_fence); without frame generation behind the game frame, for its
+    // repeat: the presenter waits for the frame's GPU work without the queue lock before presenting the repeat, whose
+    // vkQueuePresentKHR (throttled on that frame) held the lock ~10 ms while the replay's submits waited (27 fps).
+    if (presenter_wanted() && (framegen_wanted() ? !real : fence_own)) {
         if (!g_gen_fence) {
             VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
             p_vkCreateFence(g_device, &fci, nullptr, &g_gen_fence);
@@ -1144,8 +1154,10 @@ void present_image(const int32_t* crop, Record&& record) {
     if (real) vblank_hold();  // on the display's vblank its interval asks for (hle_vi.cpp)
     parts.mark(3);
     if (handed) {
-        presenter_post({g_gen_fence_used ? g_gen_fence : VK_NULL_HANDLE, rendered, index, bool(g_display_timing), when});
-        g_gen_fence_used = false;
+        // The fence is for the image after this one (the repeat) when it is this frame's own.
+        const bool give = g_gen_fence_used && !(fence_own && !framegen_wanted());
+        presenter_post({give ? g_gen_fence : VK_NULL_HANDLE, rendered, index, bool(g_display_timing), when});
+        if (give) g_gen_fence_used = false;
     } else {
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pi.waitSemaphoreCount = 1;
@@ -1200,6 +1212,7 @@ bool present_vsync_paced() {
 void gpu_present(uint64_t texture, const int32_t* crop, int interval) {
     plat::perf_hint_thread();  // the thread that presents takes part in the frame (perf_hint.cpp)
     std::unique_lock lk(g_gpu);
+    framegen_update();  // the settings screen's choice, the same for all of this frame's presents (nvn_framegen.cpp)
     g_replay_presents++;
     {  // this frame's replay work and uploads, from the window's running sums (log_timing clears them)
         static uint64_t work0 = 0, up0 = 0, pres0 = 0, fence0 = 0;
