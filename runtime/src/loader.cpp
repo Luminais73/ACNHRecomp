@@ -340,7 +340,9 @@ Fn fast_lookup(const FastModule& m, uint64_t off) {
 // An entry is one 64-bit word, so threads read and write it without a lock and never see half of one: the high half
 // is the target's key ((target - g_cache_base) / 4 + 1, 0 = empty), the low half the host function's offset from
 // kCallAnchor (all generated code is in one binary). NX_CALL_CACHE=0: off.
-constexpr unsigned kCallCacheBits = 13;  // 8192 entries, 64 KB
+// 65536 entries, 512 KB: with 8192 a scene load (the game's loader threads walk thousands of functions) missed often
+// enough that call_slow took 11% of a loader thread on the S20 FE; in play the hot entries are as few lines either way.
+constexpr unsigned kCallCacheBits = 16;
 std::atomic<uint64_t> g_call_cache[1u << kCallCacheBits];
 uint64_t g_cache_base = 0, g_cache_span = 0;  // modules within [base, base + span); span 0: the cache is off
 

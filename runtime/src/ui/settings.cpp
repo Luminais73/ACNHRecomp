@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h"  // ClearActiveID: a drag that scrolls is not a tap (drag_scroll)
 
 #include <nx/runtime.h>
 
@@ -64,6 +65,7 @@ float g_scale = 1;
 std::string g_toast;
 double g_toast_until = 0;
 bool g_restart_note = false;
+void drag_scroll(bool horizontal = false);  // below: a finger dragged over a list scrolls it
 
 void toast(const std::string& text) {
     g_toast = text;
@@ -182,6 +184,7 @@ void combo(const std::string& key, const std::string& fallback, const Choices& c
             if (ImGui::Selectable(t.c_str(), sel)) store(key, v);
             if (sel) ImGui::SetItemDefaultFocus();
         }
+        drag_scroll();  // a long list (the resolutions) scrolls under the finger too
         ImGui::EndCombo();
     }
     if (full != shown && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", full.c_str());
@@ -259,10 +262,14 @@ void toggle(const std::string& key, bool fallback, float width = 0) {
     dl->AddText(ImVec2(p.x + pill_w + 10.0f * g_scale, p.y + (h - ts.y) * 0.5f), rgb(107, 79, 54), label);
 }
 
+bool g_slider_held = false;  // a slider under the finger this frame: it takes the drag, the page does not scroll
+
 void slider(const std::string& key, int lo, int hi, int fallback, const char* fmt, float width) {
     int v = config_get_int(key, fallback);
     ImGui::SetNextItemWidth(width);
-    if (ImGui::SliderInt("##s", &v, lo, hi, fmt)) {
+    const bool changed = ImGui::SliderInt("##s", &v, lo, hi, fmt);
+    g_slider_held |= ImGui::IsItemActive();
+    if (changed) {
         config_set(key, std::to_string(v));
         apply_live(key, std::to_string(v));
     }
@@ -345,6 +352,7 @@ std::string console(const char* key) { return std::string(tr(key)) + " · " + tr
 
 void page_video() {
     section("video.section.screen");
+#if !defined(__ANDROID__)  // a phone's game is always the whole screen
     row("video.display", nullptr, [&](float w) {
         combo("video.fullscreen", "0", {{"0", tr("video.display.windowed")}, {"1", tr("video.display.fullscreen")}}, w);
     });
@@ -355,6 +363,7 @@ void page_video() {
                    {"1920x1080", "1920 × 1080"}, {"2560x1440", "2560 × 1440"}, {"3840x2160", "3840 × 2160"}},
                   w);
         });
+#endif
     row("video.vsync", "video.vsync.desc", [&](float w) { toggle("video.vsync", true, w); });
     row("video.show_fps", "video.show_fps.desc", [&](float w) { toggle("video.show_fps", config_show_fps(), w); });
 
@@ -418,20 +427,18 @@ void page_video() {
     });
     // Built-in (nvn_framegen.cpp) always; lsfg-vk when it is installed (or already chosen).
     bool lsfg = lsfg_available();
-#if defined(__ANDROID__)
-    const char* fg_default = "builtin";  // on by default there (nvn_framegen.cpp)
-#else
-    const char* fg_default = "off";
-#endif
+    const char* fg_default = "off";  // nvn_framegen.cpp
     std::string fg = config_get("video.frame_gen", fg_default);
     Choices fg_choices = {{"off", console("video.framegen.off")}, {"builtin", tr("video.framegen.builtin")}};
     if (lsfg || fg == "lsfg") fg_choices.push_back({"lsfg", tr("video.framegen.lsfg")});
     const char* fg_desc = fg == "lsfg" ? (lsfg ? "video.framegen.desc" : "video.framegen.missing") : "video.framegen.builtin.desc";
     row("video.framegen", fg_desc, [&](float w) { combo("video.frame_gen", fg_default, fg_choices, w); });
+#if !defined(__ANDROID__)  // one GPU in a phone
     row("video.gpu", nullptr, [&](float w) {
         combo("video.gpu", "auto",
               {{"auto", tr("common.auto")}, {"discrete", tr("video.gpu.discrete")}, {"integrated", tr("video.gpu.integrated")}}, w);
     });
+#endif
     row("video.shaders", "video.shaders.desc", [&](float w) { toggle("video.shader_prepare", true, w); });
 #if defined(__ANDROID__)
     row("video.async_shaders", "video.async_shaders.desc", [&](float w) { toggle("video.async_shaders", true, w); });
@@ -726,6 +733,24 @@ void page_about() {
 
 // Android without a controller: the screen is used by touch, so no keyboard keys are shown (the footer's hints, the
 // PgUp / PgDn page buttons, "(Esc)" on the resume button); with a controller its buttons are.
+// A finger dragged over a list scrolls it, as on any phone (ImGui alone scrolls with a wheel or the bar, so on a touch
+// screen the rows below the first screenful could not be reached). Past a few pixels the press is no longer a tap:
+// the item under the finger lets go, so lifting it does not press a button or open a list. Phones only.
+void drag_scroll(bool horizontal) {
+#if defined(__ANDROID__)
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) || g_slider_held) return;
+    if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) return;
+    const ImVec2 d = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, 12.0f * g_scale);
+    if (horizontal ? d.x == 0 : d.y == 0) return;
+    ImGuiIO& io = ImGui::GetIO();
+    if (ImGui::GetActiveID() != 0) ImGui::ClearActiveID();
+    if (horizontal) ImGui::SetScrollX(ImGui::GetScrollX() - io.MouseDelta.x);
+    else ImGui::SetScrollY(ImGui::GetScrollY() - io.MouseDelta.y);
+#else
+    (void)horizontal;
+#endif
+}
+
 bool touch_only() {
 #if defined(__ANDROID__)
     return plat::controller_kind().empty();
@@ -791,6 +816,7 @@ bool settings_draw(float scale, ImFont* title) {
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 ds = io.DisplaySize;
     bool portrait = ds.x < ds.y * 1.2f;
+    g_slider_held = false;  // set again by a slider still held (slider)
     // Dim the game.
     ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ds, rgb(40, 28, 12, 120));
     ImVec2 size = portrait ? ImVec2(ds.x * 0.96f, ds.y * 0.94f)
@@ -977,6 +1003,7 @@ bool settings_draw(float scale, ImFont* title) {
     // Tests: NX_UI_SCROLL=<0..1> scrolls the page that far down (headless dumps show the rows further down).
     if (static const char* sc = std::getenv("NX_UI_SCROLL"); sc && ImGui::GetScrollMaxY() > 0)
         ImGui::SetScrollY(float(std::atof(sc)) * ImGui::GetScrollMaxY());
+    drag_scroll();
     ImGui::EndChild();
     // Footer: restart note or toast, controller prompt bar, and quit.
     {
@@ -989,6 +1016,18 @@ bool settings_draw(float scale, ImFont* title) {
             ImGui::AlignTextToFramePadding();
             ImGui::TextColored(ImVec4(0.30f, 0.55f, 0.45f, 1), "%s", msg);
             ImGui::SameLine();
+#if defined(__ANDROID__)
+            // A phone app is not quit and started again by hand easily: the game starts again from here.
+            if (g_restart_note && msg == tr("common.restart_needed")) {
+                ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(124, 194, 103, 255));
+                if (ImGui::Button(tr("common.restart_now"))) {
+                    config_save();
+                    plat::restart_app();
+                }
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+            }
+#endif
         } else {
             ImGui::AlignTextToFramePadding();
             if (!touch_only()) {

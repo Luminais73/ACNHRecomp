@@ -121,6 +121,65 @@ void set_dynamic(VkCommandBuffer cb, const VkViewport& vp, const VkRect2D& sc) {
         raster_dynamic(cb, slack), std::memcpy(b.raster, raster, sizeof raster);  // (nvn_raster.cpp)
 }
 
+// A 16:9 layer laid over a widened target (the UI's composite quad, squeezed into the middle): when nothing else covered
+// the target this frame (no scene: a loading screen, the NookPhone's apps over a still world), it kept an older
+// picture, which differed between the targets the game takes in turn: strips at the edges flickered. Before the first
+// such layer of the frame the target is cleared black.
+void layer_sides(VkCommandBuffer cb, const Targets& t, bool indexed, const Cmd& c) {
+    if (!t.color_count || !t.colors[0] || !(*g_rendering) || (*t_parallel_worker)) return;
+    GpuImage* img = image_of(t.colors[0]);
+    const uint64_t frame = g_frame.load(std::memory_order_relaxed);
+    if (!img || !img->uw || img->full_frame == frame || t.views.level[0] != 0) return;
+    // The layer's quad: its first four positions span 0..1 (the whole layer).
+    const auto& st = (*g_state);
+    if (st.attribs.empty() || st.streams.empty()) return;
+    const VertexAttrib& a = st.attribs[0];
+    const uint32_t stride = a.stream < st.streams.size() ? st.streams[a.stream].stride : 0;
+    const Range& vb = st.vertex_buffers[a.stream < 16 ? a.stream : 0];
+    const uint64_t first = uint64_t(std::max(0, indexed ? c.i[1] : c.i[0]));
+    if (stride < 8 || !vb.address) return;
+    float lo[2] = {1e9f, 1e9f}, hi[2] = {-1e9f, -1e9f};
+    for (uint32_t v = 0; v < 4; v++) {
+        const uint64_t at = (first + v) * stride + a.offset;
+        if (at + 8 > vb.size) return;
+        float p[2];
+        std::memcpy(p, guest_bytes(vb.address + at), 8);
+        for (int k = 0; k < 2; k++) lo[k] = std::min(lo[k], p[k]), hi[k] = std::max(hi[k], p[k]);
+    }
+    if (std::fabs(lo[0]) > 0.01f || std::fabs(lo[1]) > 0.01f || std::fabs(hi[0] - 1) > 0.01f || std::fabs(hi[1] - 1) > 0.01f)
+        return;
+    img->full_frame = frame;
+    const VkExtent2D e = pass_extent();
+    const uint32_t w = std::min(img->width, e.width), h = std::min(img->height, e.height);
+    VkClearAttachment ca{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+    ca.clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    VkClearRect r{{{0, 0}, {w, h}}, 0, 1};
+    p_vkCmdClearAttachments(cb, 1, &ca, 1, &r);
+    static int logged = 0;
+    if (logged++ < 4) log("nvn: a 16:9 layer over target %llx (%ux%u) with nothing else drawn this frame: cleared first",
+                          (unsigned long long)t.colors[0], w, h);
+}
+
+// A window texture widened to the screen's shape (video.aspect = auto, nvn_ultrawide.cpp): what the game draws in
+// 16:9 only (loading screens, the NookPhone's apps) leaves the sides as they were, and the window textures it takes
+// in turn kept different leftovers there: strips at the edges flickered. The first pass on one after each present
+// clears its sides black; with a 3D scene the composite covers them again.
+void clear_window_sides(VkCommandBuffer cb, const Targets& t, VkExtent2D extent, uint32_t cleared) {
+    if (!t.color_count || !t.colors[0] || (*t_parallel_worker)) return;
+    Texture* tex = get<Texture>(t.colors[0]);
+    if (!tex || !(tex->flags & 1) || !tex->uw || tex->sides_cleared == g_replay_presents + 1) return;
+    tex->sides_cleared = g_replay_presents + 1;  // a pass that cleared all of it counts too (not cleared again later)
+    GpuImage* img = image_of(t.colors[0]);
+    if ((cleared & 1) || !img || t.views.level[0] != 0 || img->width <= img->height * 16 / 9 + 2) return;
+    const uint32_t mid = std::min(img->width, img->height * 16 / 9), side = (img->width - mid) / 2;
+    if (!side || extent.width < img->width || extent.height < img->height) return;
+    VkClearAttachment a{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+    a.clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    VkClearRect r[2] = {{{{0, 0}, {side, img->height}}, 0, 1},
+                        {{{int32_t(img->width - side), 0}, {side, img->height}}, 0, 1}};
+    p_vkCmdClearAttachments(cb, 1, &a, 2, r);
+}
+
 void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     if ((*t_bail)) return;
     if (clears_pending_other(t)) clears_flush(cb);  // other targets' clears first, in order
@@ -213,6 +272,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     trace_pass("begin: cleared, fresh", t, cleared, fresh);
     (*g_pass) = t;
     (*g_pass_extent) = extent;
+    clear_window_sides(cb, t, extent, cleared | fresh);
 }
 
 uint64_t g_dump_draws = 0, g_dump_request = 0;
@@ -989,6 +1049,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     // scissor (below) is still taken about the middle.
     static const bool ortho = uw_ortho_on();
     float ui_x = 0;  // what key.uw_x would be: the scissor of a UI draw
+    if (aniso && (!ui_pick || !uw_vs_scaled(vs)) && t.color_count && t.colors[0])  // the scene, a screen pass: all of it
+        if (GpuImage* ci = image_of(t.colors[0])) ci->full_frame = g_frame.load(std::memory_order_relaxed);
     if (aniso && uw_vs_scaled(vs) && ui_pick) {
         // A draw that samples a widened render target is a screen-space pass (post chain, composite) or a picture
         // of the screen (the blurred capture behind a menu): it already covers the whole target. (Only short draws
@@ -998,6 +1060,9 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             if (r.texture)
                 if (GpuImage* si = image_of(r.texture); si && si->uw && (si->sx != si->sy)) samples_wide = true;
         if (!samples_wide) ui_x = (*g_uw).ax() < 1.0f ? (*g_uw).ax() : -(*g_uw).ay();
+        if (samples_wide && t.color_count && t.colors[0])  // the capture of the screen behind a menu: all of it
+            if (GpuImage* ci = image_of(t.colors[0])) ci->full_frame = g_frame.load(std::memory_order_relaxed);
+        if (!samples_wide && (*g_uw).ax() < 1.0f) layer_sides(cb, t, indexed, c);
         static bool dbg_nosq = false;  // DEBUG: a file uw_nosqueeze turns the squeeze off while it exists
         static uint64_t dbg_next = 0;
         if ((*g_stats).total >= dbg_next && plat::debug_files()) {  // ~8 opens a frame: on a phone's FUSE, ms each

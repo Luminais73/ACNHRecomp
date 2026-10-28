@@ -57,6 +57,7 @@ struct GpuImage {
     // The last two frames (g_frame) it was rendered in: a target drawn in consecutive frames is redrawn every frame
     // (pipeline_skip_allowed may skip a draw into it while its pipeline compiles; one drawn once, a LUT, may not).
     uint64_t drawn_frame = 0, drawn_before = 0;
+    uint64_t full_frame = 0;  // a widened target: the frame a draw last covered all of it (nvn_draw.cpp, layer_sides)
 };
 
 VkDevice vk_device();

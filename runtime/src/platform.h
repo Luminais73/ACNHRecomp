@@ -71,6 +71,10 @@ void window_size(uint32_t& w, uint32_t& h);  // client size in pixels
 void screen_size(uint32_t& w, uint32_t& h);  // the display's own size, landscape (Android; the window on PC)
 // The render scale to use when the player sets none: 1 on fast GPUs, less on slower ones (Android).
 float default_render_scale();
+#if defined(__ANDROID__)
+// The app started again from its launcher activity, and this process ended (settings that take effect at start).
+[[noreturn]] void restart_app();
+#endif
 // thermal.cpp: the share of the asked rows the GPU keeps up with now (dynamic resolution; 1 elsewhere).
 float dynamic_render_scale();
 // The settings' defaults that differ on phones: there the 3D picture's rows follow the GPU ("auto", above) and FSR

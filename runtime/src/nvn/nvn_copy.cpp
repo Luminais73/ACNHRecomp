@@ -148,6 +148,12 @@ void replay_buffer_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list) {
     if (size > (256ull << 20)) return skip("implausible size");
     Upload u = to_buffer ? upload_alloc(size, 256) : upload(src, size, 16);
     uint32_t level = std::min(info.view.base_level, dst->levels - 1);
+    // The region inside the image: on a resized screen target smaller than the game's (900 rows for its 1080) the
+    // game's region went past the image's edge, which is undefined and hung the GPU on an Adreno 650.
+    if (x < 0 || y < 0 || uint64_t(x) + uint64_t(w) > std::max(1u, dst->width >> level) ||
+        uint64_t(y) + uint64_t(h) > std::max(1u, dst->height >> level) ||
+        (is3d && uint64_t(std::max(info.region[2], 0)) + uint64_t(depth) > std::max(1u, dst->depth >> level)))
+        return skip("region past the image's edge");
     uint32_t layer = is3d ? 0 : std::min<uint32_t>(uint32_t(std::max(info.region[2], 0)) + info.view.min_layer, dst->layers - 1);
     VkBufferImageCopy r{};
     r.bufferOffset = u.offset;
@@ -214,6 +220,30 @@ void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list) {
     };
     scale(*src, sl, info.src[0], info.src[1], sw, sh);
     scale(*dst, dl, info.dst[0], info.dst[1], dw, dh);
+    // Both rectangles inside their images: scaled, a region at the edge of a resized target came out as one texel
+    // past it (uw_span gives width 0 there, made 1 above), and a copy or blit outside an image is undefined: on an
+    // Adreno 650 it can hang the GPU. Clamped; nothing left: dropped.
+    auto inside = [](const GpuImage& img, uint32_t level, int32_t& x, int32_t& y, int32_t& w, int32_t& h) {
+        const int32_t ew = int32_t(std::max(1u, img.width >> level)), eh = int32_t(std::max(1u, img.height >> level));
+        if (x < 0) w += x, x = 0;
+        if (y < 0) h += y, y = 0;
+        w = std::min(w, ew - x), h = std::min(h, eh - y);
+        return w > 0 && h > 0;
+    };
+    {
+        const int32_t sw0 = sw, sh0 = sh, dw0 = dw, dh0 = dh;
+        bool ok = inside(*src, sl, info.src[0], info.src[1], sw, sh) && inside(*dst, dl, info.dst[0], info.dst[1], dw, dh);
+        // An unscaled copy keeps one size for both sides.
+        if (ok && sw0 == dw0 && sh0 == dh0) sw = dw = std::min(sw, dw), sh = dh = std::min(sh, dh);
+        if (!ok || sw != sw0 || sh != sh0 || dw != dw0 || dh != dh0) {
+            static int logged = 0;
+            if (logged++ < 10)
+                log("nvn: copy %llx -> %llx past an image's edge: %dx%d -> %dx%d clamped to %dx%d -> %dx%d%s",
+                    (unsigned long long)c.a[0], (unsigned long long)c.a[1], sw0, sh0, dw0, dh0, sw, sh, dw, dh,
+                    ok ? "" : " (dropped)");
+            if (!ok) return;
+        }
+    }
     if (same) {
         // One subresource and layer range, and the rectangles (and 3D slices) meet: Vulkan forbids it, dropped.
         bool overlap = ss.mipLevel == ds.mipLevel &&

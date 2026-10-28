@@ -125,6 +125,28 @@ void exit_process(int code) {
     _exit(code);
 }
 
+void restart_app() {
+    JNIEnv* env = nullptr;
+    if (g_app && g_app->activity->vm->AttachCurrentThread(&env, nullptr) == JNI_OK && env) {
+        jobject act = g_app->activity->clazz;
+        jclass actc = env->GetObjectClass(act);
+        jobject pm = env->CallObjectMethod(act, env->GetMethodID(actc, "getPackageManager", "()Landroid/content/pm/PackageManager;"));
+        jobject pkg = env->CallObjectMethod(act, env->GetMethodID(actc, "getPackageName", "()Ljava/lang/String;"));
+        jobject intent = pm && pkg ? env->CallObjectMethod(pm, env->GetMethodID(env->GetObjectClass(pm), "getLaunchIntentForPackage",
+                                                                                  "(Ljava/lang/String;)Landroid/content/Intent;"), pkg)
+                                   : nullptr;
+        if (intent) {
+            jclass ic = env->GetObjectClass(intent);
+            // FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK: a new task, this one gone.
+            env->CallObjectMethod(intent, env->GetMethodID(ic, "addFlags", "(I)Landroid/content/Intent;"), 0x10000000 | 0x8000);
+            env->CallVoidMethod(act, env->GetMethodID(actc, "startActivity", "(Landroid/content/Intent;)V"), intent);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        nx::log("app: restarting (settings that take effect at start)");
+    }
+    exit_process(0);
+}
+
 void sleep_ns(int64_t ns) {
     timespec ts{time_t(ns / 1000000000), long(ns % 1000000000)};
     nanosleep(&ts, nullptr);
