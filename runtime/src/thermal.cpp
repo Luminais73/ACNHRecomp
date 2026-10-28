@@ -59,12 +59,15 @@ struct Mode {
     float headroom_hot;
     int temp_hot, max_drop;
     double adpf;
+    // The battery's temperature (C) over which the ceilings come down, and under which the system's own GPU limit
+    // (SSRM: 400 MHz with the battery at ~37 C on the S20 FE) is not kept: the body stays under ~43 C either way.
+    int battery_hot, battery_ssrm;
 };
 const Mode kModes[3] = {
-    {"performance", 1.0, 1.0, 1.0, 0, 0, 99.0f, 999, 0, 0.0},
-    {"balanced", 0.85, 0.80, 0.03, 441, 1200, 0.90f, 81, 1, 0.85},
+    {"performance", 1.0, 1.0, 1.0, 0, 0, 99.0f, 999, 0, 0.0, 0, 0},
+    {"balanced", 0.85, 0.80, 0.03, 441, 1200, 0.90f, 81, 1, 0.85, 42, 41},
     // Cool trades a little: the GPU nearly full, a few late frames, and the ceilings two steps down when hot.
-    {"cool", 0.96, 0.88, 0.08, 305, 1000, 0.75f, 68, 2, 0.95},
+    {"cool", 0.96, 0.88, 0.08, 305, 1000, 0.75f, 68, 2, 0.95, 39, 0},
 };
 // The big cores' caps, MHz (the S20 FE's SSRM keeps them at 1747 even cold; the replay is memory-bound: at 1.5 GHz it
 // took only a little longer than at 1.75, and 2.5 GHz made it ~10% faster).
@@ -210,6 +213,7 @@ struct Governor {
     bool turn_gpu = true, last_down_gpu = true;
     std::string reads, restore_sent;
     double busy = -1, clk = 0, cpu_p90 = 0, late = 0;
+    int battery = -1;  // tenths of a degree C (-1: not read)
     uint32_t frames = 0, late_n = 0;
     uint64_t decided_ns = 0;  // the last decide()
     uint32_t dyn_starved = 0, dyn_roomy = 0;  // decisions in a row for dynamic_resolution
@@ -321,6 +325,7 @@ struct Governor {
         for (const Policy& p : pol) reads += "; nxrd \"p " + std::to_string(p.id) + "\" " + p.path;
         if (limit_restore > 0) reads += "; nxrd l /sys/power/cpufreq_max_limit";
         for (const std::string& z : zones) reads += "; nxrd t " + z;
+        reads += "; nxrd bat /sys/class/power_supply/battery/temp";  // tenths of a degree: the phone's body
         std::string desc;
         for (long s : steps) desc += " " + std::to_string(s);
         std::string cl;
@@ -371,6 +376,7 @@ struct Governor {
             else if (w[0] == "g") gpu_read = gpu_mhz(num(w, 1));
             else if (w[0] == "l") limit_read = num(w, 1);
             else if (w[0] == "t" && w.size() > 1) t = std::max(t, num(w, 1) > 1000 ? num(w, 1) / 1000 : num(w, 1));  // m°C mostly
+            else if (w[0] == "bat" && w.size() > 1) battery = int(num(w, 1));
             else if (w[0] == "p")
                 for (Policy& p : pol)
                     if (p.id == num(w, 1)) p.read = num(w, 2);
@@ -477,6 +483,11 @@ struct Governor {
         const bool have_temp = temp > 0;
         bool hot = have_temp ? temp >= m.temp_hot : headroom >= m.headroom_hot;
         bool cooled = have_temp ? temp < m.temp_hot - 4 : headroom < m.headroom_hot - 0.1f;
+        // The phone's body (its battery): the mode's limit (balanced 42 C, cool 39 C) is what the hand feels.
+        if (battery > 0 && m.battery_hot > 0) {
+            hot = hot || battery >= m.battery_hot * 10;
+            cooled = cooled && battery < m.battery_hot * 10 - 10;
+        }
         hot_n = hot ? hot_n + 1 : 0, cool_n = cooled ? cool_n + 1 : 0;
         if (hot_n >= 5 && drop < m.max_drop) {
             drop++, hot_n = 0;
@@ -548,7 +559,9 @@ struct Governor {
         auto put = [&](const std::string& path, long v) { w += (w.empty() ? "" : "; ") + ("echo " + std::to_string(v) + " > " + path); };
         if (!gpu_path.empty()) {
             long want = steps[size_t(std::min(gpu_idx, std::max(floor_idx(m), top() - drop)))];
-            if (mode_idx != 0 && ssrm_low) want = std::min(want, ssrm_low);  // the system's thermal limit kept
+            // The system's thermal limit kept (balanced: once the battery is over battery_ssrm; unread: always).
+            const bool keep_ssrm = m.battery_ssrm <= 0 || battery <= 0 || battery >= m.battery_ssrm * 10;
+            if (mode_idx != 0 && ssrm_low && keep_ssrm) want = std::min(want, ssrm_low);
             if (gpu_read != want) put(gpu_path, gpu_value(want));
             gpu_written = want;
         }
@@ -577,9 +590,9 @@ struct Governor {
 
     void status(int mode_idx) {
         log("thermal: %s: GPU cap %ld MHz (%.0f%% busy at %.0f MHz), big cores %ld MHz, %u of %u frames late, CPU work "
-            "p90 %.0f%%, %d C, headroom %.2f",
+            "p90 %.0f%%, %d C, battery %.1f C, headroom %.2f",
             kModes[mode_idx].name, gpu_written, busy * 100, clk, cpu_cap_mhz(cpu_level), late_n, frames,
-            cpu_p90 * 100, temp, double(headroom));
+            cpu_p90 * 100, temp, battery / 10.0, double(headroom));
     }
 };
 
