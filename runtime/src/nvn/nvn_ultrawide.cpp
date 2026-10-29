@@ -748,15 +748,17 @@ void pane_calculate(CPU& c) {
     const uint8_t basepos = *reinterpret_cast<volatile uint8_t*>(pane + 0x5b);
     const float cx = (basepos & 3) == 1 ? w * 0.5f : (basepos & 3) == 2 ? -w * 0.5f : 0.0f;  // the middle, from the
     const float cy = (basepos >> 2 & 3) == 1 ? -h * 0.5f : (basepos >> 2 & 3) == 2 ? h * 0.5f : 0.0f;  // base point
-    bool full = r != g_panes.end() && !nested, wide = false, tall = false;
+    bool full = r != g_panes.end() && !nested, wide = false, tall = false, side = false;
+    float side_f = 1.0f;  // a side band's horizontal scale
     if (full) {
         const float m00 = pane_f(pane, 0x70), m03 = pane_f(pane, 0x7c), m11 = pane_f(pane, 0x84), m13 = pane_f(pane, 0x8c);
         const float hw = std::fabs(m00) * w * 0.5f, hh = std::fabs(m11) * h * 0.5f;
         const float mx = m03 + m00 * cx, my = m13 + m11 * cy;  // its middle in the layout
         // (90%: a background under a pane an animation scales to 0.94 counts as one)
         const float W = r->second.base[0] * 0.45f, H = r->second.base[1] * 0.45f;
+        auto tall_cover = [](float my, float hh, float H) { return my - hh <= -H && my + hh >= H && hh < H * 4; };
         wide = mx - hw <= -W && mx + hw >= W && hw < W * 4;
-        tall = my - hh <= -H && my + hh >= H && hh < H * 4;
+        tall = tall_cover(my, hh, H);
         // A band only when it is thin and at an edge (the cutscene bars, 342 rows), not a 600-row panel.
         if (wide && !tall && hh > H * 0.7f) wide = false;
         if (tall && !wide && hw > W * 0.7f) tall = false;
@@ -766,6 +768,16 @@ void pane_calculate(CPU& c) {
         const float TW = r->second.base[0] * 0.5f * kx, TH = r->second.base[1] * 0.5f * ty;
         if (full && (kx <= 1.0f || (mx - hw <= -TW && mx + hw >= TW)) && (ty <= 1.0f || (my - hh <= -TH && my + hh >= TH)))
             full = false;
+        // A band as tall as the layout on one side (to the middle at most), past its edge (the circle wipe's P_L_00 /
+        // P_R_00, 1019 wide, to 1125 of 960; they meet in the middle when it closes): stretched outward about its inner edge, so its outer edge passes the target's by as much. The
+        // squeeze left the scene showing beside it.
+        const float cur = fix.base[0] != 0.0f ? pane_f(pane, 0x48) / fix.base[0] : 1.0f;
+        const float hw0 = cur > 0.0f ? hw / cur : hw, half = r != g_panes.end() ? r->second.base[0] * 0.5f : 0.0f;
+        if (!full && r != g_panes.end() && !nested && kx > 1.0f && !wide && tall_cover(my, hh, H) && m00 > 0.0f &&
+            hw0 > 1.0f && (mx < 0.0f ? -(mx - hw) : mx + hw) >= half && (mx < 0.0f ? mx + hw : hw - mx) <= half * 0.05f) {
+            side = full = true;
+            side_f = 1.0f + half * (kx - 1.0f) / (2.0f * hw0);
+        }
         static const bool trace = std::getenv("NX_UW_LAYOUT_TRACE") != nullptr;
         static std::set<uint64_t> traced;
         if (trace && !full && w >= 1000.0f && traced.insert(pane).second) {
@@ -799,8 +811,13 @@ void pane_calculate(CPU& c) {
         dbg = f;
     }
     const float cover = std::max(kx, ty) * dbg;
-    const float want[2] = {wide && tall ? cover : wide ? kx : 1.0f, wide && tall ? cover : tall ? ty : 1.0f};
-    const float shift[2] = {-(want[0] - 1.0f) * fix.base[0] * cx, -(want[1] - 1.0f) * fix.base[1] * cy};  // middle kept
+    float want[2] = {wide && tall ? cover : wide ? kx : 1.0f, wide && tall ? cover : tall ? ty : 1.0f};
+    float shift[2] = {-(want[0] - 1.0f) * fix.base[0] * cx, -(want[1] - 1.0f) * fix.base[1] * cy};  // middle kept
+    if (side) {  // the inner edge kept (local x: cx + w / 2 on the left side, cx - w / 2 on the right)
+        const float inner = cx + (pane_f(pane, 0x7c) + pane_f(pane, 0x70) * cx < 0.0f ? w : -w) * 0.5f;
+        want[0] = side_f, want[1] = 1.0f;
+        shift[0] = (1.0f - side_f) * fix.base[0] * inner, shift[1] = 0.0f;
+    }
     follow(pane, 0x48, fix.set, fix.base, want);
     follow(pane, 0x30, fix.tset, fix.tbase, shift, true);
     static const bool trace = std::getenv("NX_UW_LAYOUT_TRACE") != nullptr;
