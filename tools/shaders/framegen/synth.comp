@@ -2,8 +2,10 @@
 // Frame generation, last pass: the frame halfway between `prev` and `cur`. Each pixel picks, among the vectors around
 // it (the field interpolated, the four nearest cells' own when they differ, and zero), the one whose two ends agree
 // best, and shows the average of those ends. A pixel that did not change at all (HUD, still scenery) is copied as is,
-// so it stays sharp. Where no vector fits (something uncovered), the result leans to the plain cross-fade of the two
-// frames, and after a scene cut (most cells unmatched) the whole frame is that cross-fade.
+// so it stays sharp. Where no vector fits (a motion edge: the running player over the scrolling ground, something
+// uncovered), the pixel is the newer real frame's: that spot moves at 30 fps there but stays whole. The cross-fade it
+// took before showed both positions half transparent, a ghost every other refresh that read as the player flickering.
+// After a scene cut (most cells unmatched) the whole frame is the newer real one.
 // Colours and errors are mediump (8-bit colours; Adreno: half registers, so more waves to hide the fetches, and
 // double-rate ALU); pixel positions stay highp.
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -41,8 +43,12 @@ void pixel(ivec2 q, ivec2 base) {
     px = vec2(q) + 0.5;
     mediump vec3 a0 = texelFetch(prevc, q, 0).rgb, b0 = texelFetch(curc, q, 0).rgb;
     dm = 0.0;
-    if (err(a0, b0) < 1.5 / 255.0 || cut) {
+    if (err(a0, b0) < 1.5 / 255.0) {
         imageStore(dst, q, vec4(0.5 * (a0 + b0), 1.0));
+        return;
+    }
+    if (cut) {
+        imageStore(dst, q, vec4(b0, 1.0));
         return;
     }
     vec2 f = px / p.a.x - 0.5;
@@ -53,28 +59,25 @@ void pixel(ivec2 q, ivec2 base) {
     vec3 cb = mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
     vec2 vb = cb.xy;
     dm = cb.z;
-    if (abs(dm) > 0.12) {  // too large a change of brightness for a fade between two frames: a cut, cross-faded
-        imageStore(dst, q, vec4(0.5 * (a0 + b0), 1.0));
+    if (abs(dm) > 0.12) {  // too large a change of brightness for a fade between two frames: a cut, the newer frame
+        imageStore(dst, q, vec4(b0, 1.0));
         return;
     }
-    best_e = err(a0, b0) + 0.03;
-    best_col = 0.5 * (a0 + b0);
-    try_v(vb, 0.0);
-    // The cells' own vectors where they differ and the interpolated one does not fit (motion edges): this bounds
-    // the cost, most moving pixels take the first. A vector already tried (the interpolated one where the cells
-    // agree, or another corner's) would cost the same or more and not be taken: skipped, two fetches each.
-    if (best_e > 0.02) {
-        float spread = max(max(length(c00.xy - vb), length(c10.xy - vb)), max(length(c01.xy - vb), length(c11.xy - vb)));
-        if (spread > 0.75) {
-            if (c00.xy != vb) try_v(c00.xy, 0.01);
-            if (c10.xy != vb && c10.xy != c00.xy) try_v(c10.xy, 0.01);
-            if (c01.xy != vb && c01.xy != c00.xy && c01.xy != c10.xy) try_v(c01.xy, 0.01);
-            if (c11.xy != vb && c11.xy != c00.xy && c11.xy != c10.xy && c11.xy != c01.xy) try_v(c11.xy, 0.01);
-        }
+    // A motion edge: the cells around disagree (the player, whom the camera follows, over the scrolling ground). A
+    // vector of the ground also makes its two ends agree there (ground on both sides of the player) and painted
+    // ground over the player's legs and back: nothing is moved there, the pixel is the newer real frame's.
+    float spread = max(max(length(c00.xy - vb), length(c10.xy - vb)), max(length(c01.xy - vb), length(c11.xy - vb)));
+    if (spread > 1.5) {
+        imageStore(dst, q, vec4(b0, 1.0));
+        return;
     }
-    // No vector makes the two ends agree (something uncovered, or effects that do not move): towards the plain
-    // cross-fade, which at least does not tear.
-    best_col = mix(best_col, 0.5 * (a0 + b0), smoothstep(0.1, 0.25, best_e));
+    // Standing still (zero) first and unhandicapped: the field's vector has to do better to be taken.
+    best_e = err(a0, b0);
+    best_col = 0.5 * (a0 + b0);
+    if (best_e > 0.015) try_v(vb, 0.01);
+    // No vector makes the two ends agree well (a motion edge, something uncovered, effects that do not move): the
+    // newer real frame, whole, from a smaller mismatch on than the old cross-fade took over.
+    best_col = mix(best_col, b0, smoothstep(0.05, 0.12, best_e));
     imageStore(dst, q, vec4(best_col, 1.0));
 }
 
