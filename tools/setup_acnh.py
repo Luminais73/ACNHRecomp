@@ -327,7 +327,7 @@ def main():
         env["DOTNET_ROOT"] = dn
         env["PATH"] = dn + os.pathsep + env["PATH"]
     env["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1"
-    harness = os.path.join(P, "build", "spirv_harness", "bin", "Release", "net10.0", "spirv_harness.dll")
+    harness = os.path.join(P, "build", "spirv_harness", "bin", "x64", "Release", "net10.0", "spirv_harness.dll")
     if not os.path.exists(harness) or force("harness"):
         run([dotnet, "build", "tools/maxwell/spirv_harness/SpirvHarness.csproj", "-c", "Release", "-m:4"],
             log=os.path.join(logs, "harness.log"), env=env)
